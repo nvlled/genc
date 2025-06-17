@@ -1,0 +1,17 @@
+.{
+    .name = .acceszor,
+    .version = "0.0.0",
+    .fingerprint = 0x600d29710896ae47, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.0-dev.764+2e3154428",
+    .dependencies = .{
+        .aro = .{
+            .url = "git+https://github.com/Vexu/arocc.git#0a1bafae3f12a29c65b0cfd91f138c038cc04d34",
+            .hash = "aro-0.0.0-JSD1QowDJwDniRbMfnQ6kvt5_4aBVpUetJvLWg0gFHyS",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
