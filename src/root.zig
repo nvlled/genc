@@ -66,7 +66,7 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
             .pointer => |p| {
                 is_pointer = true;
                 switch (p.child.type(tree.comp)) {
-                    .@"struct" => |s| {
+                    .@"struct", .@"union" => |s| {
                         // when the field is a pointer to an anonymous struct,
                         // skip it, since the type shows "(anonymous TAG at path:line:col)",
                         // which is not a valid C type.
@@ -150,7 +150,7 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
             .pointer => |p| {
                 is_pointer = true;
                 switch (p.child.type(tree.comp)) {
-                    .@"struct" => |s| {
+                    .@"struct", .@"union" => |s| {
                         // when the field is a pointer to an anonymous struct,
                         // skip it, since the type shows "(anonymous TAG at path:line:col)",
                         // which is not a valid C type.
@@ -243,7 +243,6 @@ pub fn generate(allocator: std.mem.Allocator, r: anytype, w: anytype, options: O
                     });
                     if (include) {
                         try generateStructAccessors(&tree, node, w, options.include_body);
-                        try w.writeAll("\n");
                     }
                 },
                 else => {},
@@ -252,7 +251,6 @@ pub fn generate(allocator: std.mem.Allocator, r: anytype, w: anytype, options: O
             switch (node.get(&tree)) {
                 .struct_decl => {
                     try generateStructAccessors(&tree, node, w, options.include_body);
-                    try w.writeAll("\n");
                 },
                 else => {},
             }
@@ -280,6 +278,13 @@ test "aro generate" {
         \\  struct {
         \\     char *w;
         \\  } z;
+        \\  union {
+        \\    int i;
+        \\    char j;
+        \\     struct {
+        \\       int g;
+        \\     } k;
+        \\  } o;
         \\};
     ;
 
@@ -334,6 +339,170 @@ test "generate getter prototype" {
     );
 }
 
+test "struct fields" {
+    const code: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\  struct {
+        \\    int a;
+        \\    char *b;
+        \\  } data;
+        \\};
+    ;
+    const expected =
+        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
+        \\
+        \\extern inline int Foo_get_data_a(const struct Foo *self) { return self->data.a; }
+        \\
+        \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
+    ;
+
+    const output = try generateString(std.testing.allocator, code, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "anonymous structs" {
+    const code: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\  struct {
+        \\    int a;
+        \\    char *b;
+        \\  };
+        \\};
+    ;
+    const expected =
+        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
+        \\
+        \\extern inline int Foo_get_a(const struct Foo *self) { return self->a; }
+        \\
+        \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
+    ;
+
+    const output = try generateString(std.testing.allocator, code, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "unions" {
+    const code: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\
+        \\  union {
+        \\    int a;
+        \\    char *b;
+        \\  } data;
+        \\};
+    ;
+    const expected =
+        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
+        \\
+        \\extern inline int Foo_get_data_a(const struct Foo *self) { return self->data.a; }
+        \\
+        \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
+    ;
+
+    const output = try generateString(std.testing.allocator, code, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "anonymous unions" {
+    const code: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\
+        \\  union {
+        \\    int a;
+        \\    char *b;
+        \\  };
+        \\};
+    ;
+    const expected =
+        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
+        \\
+        \\extern inline int Foo_get_a(const struct Foo *self) { return self->a; }
+        \\
+        \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
+    ;
+
+    const output = try generateString(std.testing.allocator, code, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "skip pointers to anonymous structs" {
+    const code: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\  int y;
+        \\
+        \\  struct {
+        \\    int a;
+        \\    char *b;
+        \\  } *g;
+        \\};
+    ;
+    const expected =
+        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
+        \\
+        \\extern inline int Foo_get_y(const struct Foo *self) { return self->y; }
+    ;
+
+    const output = try generateString(std.testing.allocator, code, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "skip pointers to anonymous unions" {
+    const code: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\  int y;
+        \\
+        \\  union {
+        \\    int a;
+        \\    char *b;
+        \\  } *g;
+        \\};
+    ;
+    const expected =
+        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
+        \\
+        \\extern inline int Foo_get_y(const struct Foo *self) { return self->y; }
+    ;
+
+    const output = try generateString(std.testing.allocator, code, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
 test "filter by struct name" {
     const code: []const u8 =
         \\struct AAA { int x; };
@@ -352,6 +521,7 @@ test "filter by struct name" {
             }
         }.filter,
     });
+
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         std.mem.trim(u8, output, "\n "),
@@ -359,12 +529,33 @@ test "filter by struct name" {
     );
 }
 
-// TODO:
+test "filter by struct with bitfields" {
+    const code: []const u8 =
+        \\struct AAA { int x: 3; int y;  };
+        \\struct BBB { int x; };
+        \\struct CCC { int x: 2; };
+        \\struct DDD { char a; char b; };
+    ;
+    const expected =
+        \\int AAA_get_x(const struct AAA *self);
+        \\
+        \\int AAA_get_y(const struct AAA *self);
+        \\
+        \\int CCC_get_x(const struct CCC *self);
+    ;
 
-test "struct fields" {}
+    const output = try generateString(std.testing.allocator, code, .{
+        .include_body = false,
+        .filter_struct = struct {
+            pub fn filter(info: FilterArg) bool {
+                return info.has_bitfields;
+            }
+        }.filter,
+    });
 
-test "anonymous structs" {}
-
-test "unions" {}
-
-test "anonymous unions" {}
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, expected, "\n "),
+        std.mem.trim(u8, output, "\n "),
+    );
+}
