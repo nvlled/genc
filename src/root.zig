@@ -5,6 +5,8 @@ const stderr = std.io.getStdErr().writer();
 
 const String = []const u8;
 
+const field_names_buf_size = 128;
+
 const FilterArg = struct {
     name: String,
     has_bitfields: bool,
@@ -44,15 +46,16 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
 
         switch (record.qt.type(tree.comp)) {
             .@"union", .@"enum", .@"struct" => {
-                var field_names: []const String = &.{ident};
-                if (std.mem.eql(u8, ident, "struct")) {
-                    field_names = &.{};
+                var field_names = try std.BoundedArray(String, field_names_buf_size).init(0);
+
+                if (!std.mem.eql(u8, ident, "struct")) {
+                    try field_names.append(ident);
                 }
 
                 if (prev_field) |f| {
                     try generateSubAccessors(tree, f, w, .{
                         .struct_name = struct_name,
-                        .field_names = field_names,
+                        .field_names = &field_names,
                         .type_name_buf = &type_name_buf,
                         .include_body = include_body,
                     });
@@ -95,7 +98,7 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
 
 fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: struct {
     struct_name: []const u8,
-    field_names: []const String,
+    field_names: *std.BoundedArray(String, field_names_buf_size),
     type_name_buf: *std.io.StreamSource,
     include_body: bool,
 }) !void {
@@ -129,14 +132,14 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
         switch (record.qt.type(tree.comp)) {
             .@"union", .@"enum", .@"struct" => {
                 if (prev_field) |f| {
-                    var buf: [32]String = undefined;
-                    @memcpy(buf[0..field_names.len], field_names);
-                    buf[field_names.len] = ident;
-                    const sub_field_names: []const String = buf[0 .. field_names.len + 1];
+                    const n = field_names.len;
+                    // error can't happen since n is guaranteed <= max_capacity
+                    defer field_names.resize(n) catch {};
+                    try field_names.append(ident);
 
                     try generateSubAccessors(tree, f, w, .{
                         .struct_name = struct_name,
-                        .field_names = sub_field_names,
+                        .field_names = field_names,
                         .type_name_buf = type_name_buf,
                         .include_body = include_body,
                     });
@@ -170,7 +173,7 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
         if (!is_pointer) try w.writeAll(" ");
         try w.writeAll(struct_name);
         try w.writeAll("_get");
-        for (field_names) |f| {
+        for (field_names.slice()) |f| {
             try w.writeAll("_");
             try w.writeAll(f);
         }
@@ -182,15 +185,16 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
 
         if (include_body) {
             try w.writeAll(" { return self->");
-            for (field_names) |f| {
+            for (field_names.slice()) |f| {
                 try w.writeAll(f);
                 try w.writeAll(".");
             }
             try w.writeAll(ident);
-            try w.writeAll("; }\n");
+            try w.writeAll("; }");
         } else {
-            try w.writeAll(";\n");
+            try w.writeAll(";");
         }
+        try w.writeAll("\n\n");
     }
 }
 
