@@ -7,13 +7,18 @@ const String = []const u8;
 
 const field_names_buf_size = 128;
 
-const FilterArg = struct {
+pub const FilterItem = struct {
     name: String,
     has_bitfields: bool,
 };
 
-const Options = struct {
-    filter_struct: ?(fn (val: FilterArg) bool) = null,
+pub const FilterOption = struct {
+    context: *anyopaque = undefined,
+    predicate: *const fn (item: FilterItem, context: *anyopaque) bool,
+};
+
+pub const Options = struct {
+    filter: ?FilterOption = null,
     include_body: bool = true,
 };
 
@@ -233,14 +238,14 @@ pub fn generate(allocator: std.mem.Allocator, r: anytype, w: anytype, options: O
     defer tree.deinit();
 
     for (tree.root_decls.items) |node| {
-        if (options.filter_struct) |filter| {
+        if (options.filter) |filter| {
             switch (node.get(&tree)) {
                 .struct_decl => |decl| {
                     const struct_name = tree.tokSlice(decl.name_or_kind_tok);
-                    const include = filter(.{
+                    const include = filter.predicate(.{
                         .has_bitfields = has_bitfield(&tree, decl),
                         .name = struct_name,
-                    });
+                    }, filter.context);
                     if (include) {
                         try generateStructAccessors(&tree, node, w, options.include_body);
                     }
@@ -515,11 +520,13 @@ test "filter by struct name" {
 
     const output = try generateString(std.testing.allocator, code, .{
         .include_body = false,
-        .filter_struct = struct {
-            pub fn filter(info: FilterArg) bool {
-                return std.mem.eql(u8, info.name, "AAA");
-            }
-        }.filter,
+        .filter = FilterOption{
+            .predicate = struct {
+                fn apply(item: FilterItem, _: *anyopaque) bool {
+                    return std.mem.eql(u8, item.name, "AAA");
+                }
+            }.apply,
+        },
     });
 
     defer std.testing.allocator.free(output);
@@ -546,11 +553,13 @@ test "filter by struct with bitfields" {
 
     const output = try generateString(std.testing.allocator, code, .{
         .include_body = false,
-        .filter_struct = struct {
-            pub fn filter(info: FilterArg) bool {
-                return info.has_bitfields;
-            }
-        }.filter,
+        .filter = FilterOption{
+            .predicate = struct {
+                fn apply(item: FilterItem, _: *anyopaque) bool {
+                    return item.has_bitfields;
+                }
+            }.apply,
+        },
     });
 
     defer std.testing.allocator.free(output);
