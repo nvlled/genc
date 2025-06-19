@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("aro");
-    const mod = b.addModule("acceszor", .{
+    const mod = b.addModule("c-accessor", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
@@ -20,13 +20,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "acceszor",
+        .name = "c-accessor",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "acceszor", .module = mod },
+                .{ .name = "c-accessor", .module = mod },
             },
         }),
     });

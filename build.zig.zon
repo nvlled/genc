@@ -1,7 +1,7 @@
 .{
-    .name = .acceszor,
+    .name = .c_accessor,
     .version = "0.0.0",
-    .fingerprint = 0x600d29710896ae47, // Changing this has security and trust implications.
+    .fingerprint = 0x7e4f9435854c72e9, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.0-dev.764+2e3154428",
     .dependencies = .{
         .aro = .{

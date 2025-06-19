@@ -1,6 +1,6 @@
 const std = @import("std");
 const stdout = std.io.getStdOut().writer();
-const acceszor = @import("acceszor");
+const accessor = @import("c-accessor");
 
 const OptionNames = enum {
     @"with-name",
@@ -142,10 +142,10 @@ pub fn _main() !void {
         if (options.name_filters.size == 0 and !options.include_bitfields)
             null
         else
-            acceszor.FilterOption{
+            accessor.FilterOption{
                 .context = &options,
                 .predicate = &struct {
-                    fn apply(item: acceszor.FilterItem, context: *anyopaque) bool {
+                    fn apply(item: accessor.FilterItem, context: *anyopaque) bool {
                         const opt: *Options = @ptrCast(@alignCast(context));
                         const names = opt.name_filters;
                         if (names.contains(item.name)) return true;
@@ -154,7 +154,7 @@ pub fn _main() !void {
                 }.apply,
             };
 
-    try acceszor.generate(allocator, input_file.reader(), output_file.writer(), .{
+    try accessor.generate(allocator, input_file.reader(), output_file.writer(), .{
         .filter = filter,
         .include_body = true,
     });
@@ -166,7 +166,7 @@ pub fn _main() !void {
         });
         defer header_file.close();
         try input_file.seekTo(0);
-        try acceszor.generate(allocator, input_file.reader(), header_file.writer(), .{
+        try accessor.generate(allocator, input_file.reader(), header_file.writer(), .{
             .filter = filter,
             .include_body = false,
         });
