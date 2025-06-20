@@ -1,6 +1,6 @@
 const std = @import("std");
 const stdout = std.io.getStdOut().writer();
-const accessor = @import("c-accessor");
+const accessor = @import("c_accessor");
 
 const OptionNames = enum {
     @"with-name",
@@ -18,6 +18,7 @@ const Options = struct {
 
 fn usage(argv: [][:0]u8) !void {
     try stdout.print("usage: {s} <c-source-file> [destination]\n", .{argv[0]});
+    try stdout.print("  default destination is $filename-accessors.c\n", .{});
     try stdout.print("\n", .{});
     try stdout.print("description:\n", .{});
     try stdout.print("  generates struct getter/setter functions\n", .{});

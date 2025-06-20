@@ -1,5 +1,5 @@
 
-# c-accessor
+# c_accessor
 A zig library and CLI program to generate getter functions for C structs.
 
 For instance, given the following source:
