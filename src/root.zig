@@ -9,7 +9,7 @@ const field_names_buf_size = 128;
 
 pub const FilterItem = struct {
     name: String,
-    has_bitfields: bool,
+    has_bitfields: bool = false,
 };
 
 pub const FilterOption = struct {
@@ -17,9 +17,12 @@ pub const FilterOption = struct {
     predicate: *const fn (item: FilterItem, context: *anyopaque) bool,
 };
 
-pub const Options = struct {
+pub const AccessorOptions = struct {
     filter: ?FilterOption = null,
     include_body: bool = true,
+};
+pub const ProtoOptions = struct {
+    filter: ?FilterOption = null,
 };
 
 fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: anytype, include_body: bool) !void {
@@ -203,20 +206,7 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
     }
 }
 
-// Caller should free returned string
-pub fn generateString(allocator: std.mem.Allocator, code: String, options: Options) !String {
-    const len: f32 = @floatFromInt(code.len);
-    var buffer = try allocator.alloc(u8, @intFromFloat(@ceil(len / 1024) * 1024 * 2));
-    defer allocator.free(buffer);
-
-    var w = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(buffer[0..]) };
-    var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
-    try generate(allocator, &r.reader(), &w.writer(), options);
-
-    return allocator.dupe(u8, w.buffer.getWritten());
-}
-
-pub fn generate(allocator: std.mem.Allocator, r: anytype, w: anytype, options: Options) !void {
+pub fn generateAccessors(allocator: std.mem.Allocator, r: anytype, w: anytype, options: AccessorOptions) !void {
     var diagnostics: aro.Diagnostics = .{ .output = .ignore };
     var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
     defer comp.deinit();
@@ -237,30 +227,129 @@ pub fn generate(allocator: std.mem.Allocator, r: anytype, w: anytype, options: O
     var tree = try aro.Parser.parse(&pp);
     defer tree.deinit();
 
-    for (tree.root_decls.items) |node| {
+    loop: for (tree.root_decls.items) |node| {
+        const decl = switch (node.get(&tree)) {
+            else => continue :loop,
+            .struct_decl => |e| e,
+        };
+
         if (options.filter) |filter| {
-            switch (node.get(&tree)) {
-                .struct_decl => |decl| {
-                    const struct_name = tree.tokSlice(decl.name_or_kind_tok);
-                    const include = filter.predicate(.{
-                        .has_bitfields = has_bitfield(&tree, decl),
-                        .name = struct_name,
-                    }, filter.context);
-                    if (include) {
-                        try generateStructAccessors(&tree, node, w, options.include_body);
-                    }
-                },
-                else => {},
+            const struct_name = tree.tokSlice(decl.name_or_kind_tok);
+            const include = filter.predicate(.{
+                .has_bitfields = has_bitfield(&tree, decl),
+                .name = struct_name,
+            }, filter.context);
+
+            if (!include) continue :loop;
+        }
+
+        try generateStructAccessors(&tree, node, w, options.include_body);
+    }
+}
+
+pub fn generateProto(allocator: std.mem.Allocator, r: anytype, w: anytype, options: ProtoOptions) !void {
+    var diagnostics: aro.Diagnostics = .{ .output = .ignore };
+    var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
+    comp.langopts.preserve_comments = true;
+    defer comp.deinit();
+
+    const file = try comp.addSourceFromReader(r, "file.c", .user);
+    const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
+    var pp = aro.Preprocessor.init(&comp, .default);
+
+    defer pp.deinit();
+    try pp.addBuiltinMacros();
+    _ = try pp.preprocess(builtin_macros);
+
+    const eof = try pp.preprocess(file);
+    try pp.addToken(eof);
+
+    var tree = try aro.Parser.parse(&pp);
+    defer tree.deinit();
+
+    const ids = tree.tokens.items(.id);
+
+    loop: for (tree.root_decls.items) |node_index| {
+        const f = switch (node_index.get(&tree)) {
+            else => continue :loop,
+            .function => |f| f,
+        };
+
+        if (options.filter) |filter| {
+            const name = tree.tokSlice(f.name_tok);
+            const include = filter.predicate(.{
+                .has_bitfields = false,
+                .name = name,
+            }, filter.context);
+
+            if (!include) continue :loop;
+        }
+
+        // search and print comments at the top of a function
+        const fn_index = node_index.tok(&tree);
+        if (fn_index >= 2) {
+            // fn_index points to function name,
+            // fn_index-1 to the return token,
+            // so start looking at -2 offset
+            const end_index = fn_index - 1;
+            var idx: i32 = @intCast(end_index - 1); // cast to i32 to prevent overflow
+            while (idx >= 0) : (idx -= 1) {
+                switch (ids[@intCast(idx)]) {
+                    .comment, .unterminated_comment => {},
+                    else => break,
+                }
             }
-        } else {
-            switch (node.get(&tree)) {
-                .struct_decl => {
-                    try generateStructAccessors(&tree, node, w, options.include_body);
-                },
-                else => {},
+
+            const start_index: usize = @intCast(idx + 1);
+            for (start_index..end_index) |i| {
+                const content = tree.tokSlice(@intCast(i));
+                try w.writeAll(content);
+                try w.writeAll("\n");
             }
         }
+
+        switch (f.qt.type(tree.comp)) {
+            else => {},
+            .func => |f_type| {
+                try f_type.return_type.print(tree.comp, w);
+                try w.writeAll(" ");
+                try w.writeAll(tree.tokSlice(f.name_tok));
+                try w.writeAll("(");
+                for (f_type.params, 0..) |p, idx| {
+                    if (idx > 0) try w.writeAll(", ");
+                    const name = tree.tokSlice(p.name_tok);
+                    try p.qt.printNamed(name, tree.comp, w);
+                }
+                try w.writeAll(");\n\n");
+            },
+        }
     }
+}
+
+// Caller should free returned string
+pub fn generateAccessorsString(allocator: std.mem.Allocator, code: String, options: AccessorOptions) !String {
+    const len: f32 = @floatFromInt(code.len);
+    var buffer = try allocator.alloc(u8, @intFromFloat(@ceil(len / 1024) * 1024 * 2));
+    defer allocator.free(buffer);
+
+    var w = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(buffer[0..]) };
+    var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
+    try generateAccessors(allocator, r.reader(), w.writer(), options);
+
+    return allocator.dupe(u8, w.buffer.getWritten());
+}
+
+// Caller should free returned string
+pub fn generateProtoString(allocator: std.mem.Allocator, code: String, options: ProtoOptions) !String {
+    const len: f32 = @floatFromInt(code.len);
+    var buffer = try allocator.alloc(u8, @intFromFloat(@ceil(len / 1024) * 1024 * 10));
+    defer allocator.free(buffer);
+
+    var w = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(buffer[0..]) };
+    var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
+    try generateProto(allocator, r.reader(), w.writer(), options);
+
+    return allocator.dupe(u8, w.buffer.getWritten());
 }
 
 fn has_bitfield(tree: *aro.Tree, decl: Node.ContainerDecl) bool {
@@ -273,31 +362,6 @@ fn has_bitfield(tree: *aro.Tree, decl: Node.ContainerDecl) bool {
         }
     }
     return false;
-}
-
-test "aro generate" {
-    const buffer: []const u8 =
-        \\struct Foo {
-        \\  int x;
-        \\  int *y;
-        \\  struct {
-        \\     char *w;
-        \\  } z;
-        \\  union {
-        \\    int i;
-        \\    char j;
-        \\     struct {
-        \\       int g;
-        \\     } k;
-        \\  } o;
-        \\};
-    ;
-
-    var source = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(buffer) };
-    try generate(std.testing.allocator, &source.reader(), stderr, .{ .include_body = true });
-    try stderr.writeAll("\n");
-    // try source.seekTo(0);
-    // try generate(std.testing.allocator, &source.reader(), stderr, .{ .include_body = false });
 }
 
 test "generate getters" {
@@ -314,7 +378,7 @@ test "generate getters" {
         \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{});
+    const output = try generateAccessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         std.mem.trim(u8, output, "\n "),
@@ -336,7 +400,7 @@ test "generate getter prototype" {
         \\char *Foo_get_b(const struct Foo *self);
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{ .include_body = false });
+    const output = try generateAccessorsString(std.testing.allocator, code, .{ .include_body = false });
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         std.mem.trim(u8, output, "\n "),
@@ -362,7 +426,7 @@ test "struct fields" {
         \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{});
+    const output = try generateAccessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
@@ -389,7 +453,7 @@ test "anonymous structs" {
         \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{});
+    const output = try generateAccessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
@@ -417,7 +481,7 @@ test "unions" {
         \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{});
+    const output = try generateAccessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
@@ -445,7 +509,7 @@ test "anonymous unions" {
         \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{});
+    const output = try generateAccessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
@@ -472,7 +536,7 @@ test "skip pointers to anonymous structs" {
         \\extern inline int Foo_get_y(const struct Foo *self) { return self->y; }
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{});
+    const output = try generateAccessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
@@ -499,7 +563,7 @@ test "skip pointers to anonymous unions" {
         \\extern inline int Foo_get_y(const struct Foo *self) { return self->y; }
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{});
+    const output = try generateAccessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
@@ -518,7 +582,7 @@ test "filter by struct name" {
         \\int AAA_get_x(const struct AAA *self);
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{
+    const output = try generateAccessorsString(std.testing.allocator, code, .{
         .include_body = false,
         .filter = FilterOption{
             .predicate = struct {
@@ -551,7 +615,7 @@ test "filter by struct with bitfields" {
         \\int CCC_get_x(const struct CCC *self);
     ;
 
-    const output = try generateString(std.testing.allocator, code, .{
+    const output = try generateAccessorsString(std.testing.allocator, code, .{
         .include_body = false,
         .filter = FilterOption{
             .predicate = struct {
@@ -566,5 +630,67 @@ test "filter by struct with bitfields" {
     try std.testing.expectEqualStrings(
         std.mem.trim(u8, expected, "\n "),
         std.mem.trim(u8, output, "\n "),
+    );
+}
+
+test "test generateProto" {
+    const code: []const u8 =
+        \\// this is foo function
+        \\// it adds two number
+        \\int foo(int x, int y) { return x+y; }
+        \\/** bar does something
+        \\    but returns nothing
+        \\*/
+        \\void bar(char z) { }
+        \\void baz() { }
+        \\/*end of file*/
+    ;
+    const expected =
+        \\// this is foo function
+        \\// it adds two number
+        \\int foo(int x, int y);
+        \\
+        \\/** bar does something
+        \\    but returns nothing
+        \\*/
+        \\void bar(char z);
+        \\
+        \\void baz();
+    ;
+
+    const output = try generateProtoString(std.testing.allocator, code, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "test generateProto with filter" {
+    const code: []const u8 =
+        \\int f1(int x, int y) { return x+y; }
+        \\int f2(int x, int y) { return x+y; }
+        \\int f3(int x, int y) { return x+y; }
+        \\int f4(int x, int y) { return x+y; }
+    ;
+    const expected =
+        \\int f1(int x, int y);
+        \\
+        \\int f3(int x, int y);
+    ;
+
+    const output = try generateProtoString(std.testing.allocator, code, .{ .filter = .{
+        .predicate = struct {
+            fn _(item: FilterItem, _: *anyopaque) bool {
+                return std.mem.eql(u8, item.name, "f1") or std.mem.eql(u8, item.name, "f3");
+            }
+        }._,
+    } });
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
     );
 }
