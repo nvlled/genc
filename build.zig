@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("aro");
+
     const mod = b.addModule("c_accessor", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

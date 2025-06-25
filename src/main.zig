@@ -157,7 +157,7 @@ pub fn _main() !void {
 
     try accessor.generate(allocator, input_file.reader(), output_file.writer(), .{
         .filter = filter,
-        .include_body = true,
+        .include_path = true,
     });
 
     if (options.generate_header) {
@@ -169,7 +169,7 @@ pub fn _main() !void {
         try input_file.seekTo(0);
         try accessor.generate(allocator, input_file.reader(), header_file.writer(), .{
             .filter = filter,
-            .include_body = false,
+            .include_path = false,
         });
     }
 }

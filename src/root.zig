@@ -19,13 +19,15 @@ pub const FilterOption = struct {
 
 pub const AccessorOptions = struct {
     filter: ?FilterOption = null,
-    include_body: bool = true,
+    generate_body: bool = true,
+    include_path: []const []const u8 = &.{},
 };
 pub const ProtoOptions = struct {
     filter: ?FilterOption = null,
+    include_path: []const []const u8 = &.{},
 };
 
-fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: anytype, include_body: bool) !void {
+fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: anytype, generate_body: bool) !void {
     const struct_node = node_index.get(tree);
     const decl: Node.ContainerDecl = val: switch (struct_node) {
         else => return,
@@ -65,7 +67,7 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
                         .struct_name = struct_name,
                         .field_names = &field_names,
                         .type_name_buf = &type_name_buf,
-                        .include_body = include_body,
+                        .generate_body = generate_body,
                     });
                     prev_field = null;
                     continue :loop;
@@ -91,11 +93,11 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
         const type_str = type_name_buf.buffer.getWritten();
         const return_type_space = if (is_pointer) "" else " ";
 
-        if (include_body) {
+        if (generate_body) {
             try w.writeAll("extern inline ");
         }
         try w.print("{s}{s}{s}_get_{s}(const struct {s} *self)", .{ type_str, return_type_space, struct_name, ident, struct_name });
-        if (include_body) {
+        if (generate_body) {
             try w.print(" {{ return self->{s}; }}\n", .{ident});
         } else {
             try w.writeAll(";\n");
@@ -108,12 +110,12 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
     struct_name: []const u8,
     field_names: *std.BoundedArray(String, field_names_buf_size),
     type_name_buf: *std.io.StreamSource,
-    include_body: bool,
+    generate_body: bool,
 }) !void {
     const struct_name = args.struct_name;
     const field_names = args.field_names;
     const type_name_buf = args.type_name_buf;
-    const include_body = args.include_body;
+    const generate_body = args.generate_body;
 
     const container: Node.ContainerDecl = blk: switch (node) {
         .struct_decl, .enum_decl, .union_decl => |f| {
@@ -149,7 +151,7 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
                         .struct_name = struct_name,
                         .field_names = field_names,
                         .type_name_buf = type_name_buf,
-                        .include_body = include_body,
+                        .generate_body = generate_body,
                     });
                     prev_field = null;
                     continue :loop;
@@ -175,7 +177,7 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
 
         const type_str = type_name_buf.buffer.getWritten();
 
-        if (include_body) try w.writeAll("extern inline ");
+        if (generate_body) try w.writeAll("extern inline ");
 
         try w.writeAll(type_str);
         if (!is_pointer) try w.writeAll(" ");
@@ -191,7 +193,7 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
         try w.writeAll(struct_name);
         try w.writeAll(" *self)");
 
-        if (include_body) {
+        if (generate_body) {
             try w.writeAll(" { return self->");
             for (field_names.slice()) |f| {
                 try w.writeAll(f);
@@ -211,8 +213,11 @@ pub fn generateAccessors(allocator: std.mem.Allocator, r: anytype, w: anytype, o
     var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
     defer comp.deinit();
 
-    const file = try comp.addSourceFromReader(r, "file.c", .user);
+    for (options.include_path) |path| {
+        try comp.include_dirs.append(allocator, path);
+    }
 
+    const file = try comp.addSourceFromReader(r, "file.c", .user);
     const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
 
     var pp = aro.Preprocessor.init(&comp, .default);
@@ -243,15 +248,19 @@ pub fn generateAccessors(allocator: std.mem.Allocator, r: anytype, w: anytype, o
             if (!include) continue :loop;
         }
 
-        try generateStructAccessors(&tree, node, w, options.include_body);
+        try generateStructAccessors(&tree, node, w, options.generate_body);
     }
 }
 
 pub fn generateProto(allocator: std.mem.Allocator, r: anytype, w: anytype, options: ProtoOptions) !void {
     var diagnostics: aro.Diagnostics = .{ .output = .ignore };
     var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
-    comp.langopts.preserve_comments = true;
     defer comp.deinit();
+
+    comp.langopts.preserve_comments = true;
+    for (options.include_path) |path| {
+        try comp.include_dirs.append(allocator, path);
+    }
 
     const file = try comp.addSourceFromReader(r, "file.c", .user);
     const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
@@ -400,7 +409,7 @@ test "generate getter prototype" {
         \\char *Foo_get_b(const struct Foo *self);
     ;
 
-    const output = try generateAccessorsString(std.testing.allocator, code, .{ .include_body = false });
+    const output = try generateAccessorsString(std.testing.allocator, code, .{ .generate_body = false });
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
         std.mem.trim(u8, output, "\n "),
@@ -583,7 +592,7 @@ test "filter by struct name" {
     ;
 
     const output = try generateAccessorsString(std.testing.allocator, code, .{
-        .include_body = false,
+        .generate_body = false,
         .filter = FilterOption{
             .predicate = struct {
                 fn apply(item: FilterItem, _: *anyopaque) bool {
@@ -616,7 +625,7 @@ test "filter by struct with bitfields" {
     ;
 
     const output = try generateAccessorsString(std.testing.allocator, code, .{
-        .include_body = false,
+        .generate_body = false,
         .filter = FilterOption{
             .predicate = struct {
                 fn apply(item: FilterItem, _: *anyopaque) bool {
@@ -633,7 +642,7 @@ test "filter by struct with bitfields" {
     );
 }
 
-test "test generateProto" {
+test "generateProto" {
     const code: []const u8 =
         \\// this is foo function
         \\// it adds two number
@@ -667,7 +676,7 @@ test "test generateProto" {
     );
 }
 
-test "test generateProto with filter" {
+test "generateProto with filter" {
     const code: []const u8 =
         \\int f1(int x, int y) { return x+y; }
         \\int f2(int x, int y) { return x+y; }
@@ -687,6 +696,58 @@ test "test generateProto with filter" {
             }
         }._,
     } });
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "include path 1" {
+    const code: []const u8 =
+        \\#include "funcs.h"
+    ;
+
+    const expected =
+        \\int f1(int x, int y);
+        \\
+        \\int f2(int x, int y);
+        \\
+        \\int f3(int x, int y);
+        \\
+        \\int f4(int x, int y);
+    ;
+
+    const output = try generateProtoString(std.testing.allocator, code, .{
+        .include_path = &[_][]const u8{"test"},
+    });
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "include path 2" {
+    const code: []const u8 =
+        \\#include "struct.h"
+    ;
+
+    const expected =
+        \\int Foo_get_x(const struct Foo *self);
+        \\
+        \\int Foo_get_y(const struct Foo *self);
+        \\
+        \\int Foo_get_z(const struct Foo *self);
+    ;
+
+    const output = try generateAccessorsString(std.testing.allocator, code, .{
+        .generate_body = false,
+        .include_path = &[_][]const u8{"test"},
+    });
+
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
