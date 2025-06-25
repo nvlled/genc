@@ -1,6 +1,9 @@
 
-# c_accessor
-A zig library and CLI program to generate getter functions for C structs.
+# genc
+A zig library and CLI program that generates C code for:
+
+- struct field getters
+- function prototypes
 
 For instance, given the following source:
 ```c
@@ -9,17 +12,30 @@ struct AAA {
     int x;
     int y;
 };
+
+void some_func(int x) {
+    return x+1;
+}
+
+void another func(int x, int y) {
+    return x+y;
+}
 ```
-... the getters will be generated:
+... the following can be generated:
 
 ```c
-// file: a-struct-getters.c
+// getters with function body
 extern inline int AAA_get_x(const struct AAA *self) { return self->x; }
 extern inline int AAA_get_y(const struct AAA *self) { return self->y; }
 
-// file: a-struct-getters.h
+// getters prototypes
 int AAA_get_x(const struct AAA *self);
 int AAA_get_y(const struct AAA *self);
+
+// function prototypes
+void some_func(int x);
+void another func(int x, int y);
+
 ```
 
 

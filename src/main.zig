@@ -1,6 +1,6 @@
 const std = @import("std");
 const stdout = std.io.getStdOut().writer();
-const accessor = @import("c_accessor");
+const genc = @import("genc");
 
 const OptionNames = enum {
     @"with-name",
