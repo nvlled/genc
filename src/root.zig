@@ -7,25 +7,37 @@ const String = []const u8;
 
 const field_names_buf_size = 128;
 
-pub const FilterItem = struct {
+pub const StructItem = struct {
     name: String,
     has_bitfields: bool = false,
 };
 
-pub const FilterOption = struct {
+pub const FuncItem = struct {
+    name: String,
+    @"inline": bool,
+    static: bool,
+};
+
+pub const StructFilter = struct {
     context: *anyopaque = undefined,
-    predicate: *const fn (item: FilterItem, context: *anyopaque) bool,
+    predicate: *const fn (item: StructItem, context: *anyopaque) bool,
+};
+
+pub const FuncFilter = struct {
+    context: *anyopaque = undefined,
+    predicate: *const fn (item: FuncItem, context: *anyopaque) bool,
 };
 
 pub const AccessorOptions = struct {
-    filter: ?FilterOption = null,
+    filter: ?StructFilter = null,
     generate_body: bool = true,
     include_path: []const []const u8 = &.{},
     prepend_str: []const u8 = &.{},
     append_str: []const u8 = &.{},
 };
+
 pub const ProtoOptions = struct {
-    filter: ?FilterOption = null,
+    filter: ?FuncFilter = null,
     include_path: []const []const u8 = &.{},
     prepend_str: []const u8 = &.{},
     append_str: []const u8 = &.{},
@@ -97,9 +109,8 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
         const type_str = type_name_buf.buffer.getWritten();
         const return_type_space = if (is_pointer) "" else " ";
 
-        if (generate_body) {
-            try w.writeAll("extern inline ");
-        }
+        if (generate_body) try w.writeAll("extern inline ");
+
         try w.print("{s}{s}{s}_get_{s}(const struct {s} *self)", .{ type_str, return_type_space, struct_name, ident, struct_name });
         if (generate_body) {
             try w.print(" {{ return self->{s}; }}\n", .{ident});
@@ -297,8 +308,9 @@ pub fn generateProto(allocator: std.mem.Allocator, r: anytype, w: anytype, optio
         if (options.filter) |filter| {
             const name = tree.tokSlice(f.name_tok);
             const include = filter.predicate(.{
-                .has_bitfields = false,
                 .name = name,
+                .@"inline" = f.@"inline",
+                .static = f.static,
             }, filter.context);
 
             if (!include) continue :loop;
@@ -605,9 +617,9 @@ test "filter by struct name" {
 
     const output = try generateAccessorsString(std.testing.allocator, code, .{
         .generate_body = false,
-        .filter = FilterOption{
+        .filter = .{
             .predicate = struct {
-                fn apply(item: FilterItem, _: *anyopaque) bool {
+                fn apply(item: StructItem, _: *anyopaque) bool {
                     return std.mem.eql(u8, item.name, "AAA");
                 }
             }.apply,
@@ -638,9 +650,9 @@ test "filter by struct with bitfields" {
 
     const output = try generateAccessorsString(std.testing.allocator, code, .{
         .generate_body = false,
-        .filter = FilterOption{
+        .filter = .{
             .predicate = struct {
-                fn apply(item: FilterItem, _: *anyopaque) bool {
+                fn apply(item: StructItem, _: *anyopaque) bool {
                     return item.has_bitfields;
                 }
             }.apply,
@@ -701,13 +713,15 @@ test "generateProto with filter" {
         \\int f3(int x, int y);
     ;
 
-    const output = try generateProtoString(std.testing.allocator, code, .{ .filter = .{
-        .predicate = struct {
-            fn _(item: FilterItem, _: *anyopaque) bool {
-                return std.mem.eql(u8, item.name, "f1") or std.mem.eql(u8, item.name, "f3");
-            }
-        }._,
-    } });
+    const output = try generateProtoString(std.testing.allocator, code, .{
+        .filter = .{
+            .predicate = struct {
+                fn _(item: FuncItem, _: *anyopaque) bool {
+                    return std.mem.eql(u8, item.name, "f1") or std.mem.eql(u8, item.name, "f3");
+                }
+            }._,
+        },
+    });
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
