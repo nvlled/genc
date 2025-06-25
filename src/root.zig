@@ -21,10 +21,14 @@ pub const AccessorOptions = struct {
     filter: ?FilterOption = null,
     generate_body: bool = true,
     include_path: []const []const u8 = &.{},
+    prepend_str: []const u8 = &.{},
+    append_str: []const u8 = &.{},
 };
 pub const ProtoOptions = struct {
     filter: ?FilterOption = null,
     include_path: []const []const u8 = &.{},
+    prepend_str: []const u8 = &.{},
+    append_str: []const u8 = &.{},
 };
 
 fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: anytype, generate_body: bool) !void {
@@ -232,6 +236,8 @@ pub fn generateAccessors(allocator: std.mem.Allocator, r: anytype, w: anytype, o
     var tree = try aro.Parser.parse(&pp);
     defer tree.deinit();
 
+    try w.writeAll(options.prepend_str);
+
     loop: for (tree.root_decls.items) |node| {
         const decl = switch (node.get(&tree)) {
             else => continue :loop,
@@ -250,6 +256,8 @@ pub fn generateAccessors(allocator: std.mem.Allocator, r: anytype, w: anytype, o
 
         try generateStructAccessors(&tree, node, w, options.generate_body);
     }
+
+    try w.writeAll(options.append_str);
 }
 
 pub fn generateProto(allocator: std.mem.Allocator, r: anytype, w: anytype, options: ProtoOptions) !void {
@@ -277,6 +285,8 @@ pub fn generateProto(allocator: std.mem.Allocator, r: anytype, w: anytype, optio
     defer tree.deinit();
 
     const ids = tree.tokens.items(.id);
+
+    try w.writeAll(options.prepend_str);
 
     loop: for (tree.root_decls.items) |node_index| {
         const f = switch (node_index.get(&tree)) {
@@ -333,6 +343,8 @@ pub fn generateProto(allocator: std.mem.Allocator, r: anytype, w: anytype, optio
             },
         }
     }
+
+    try w.writeAll(options.append_str);
 }
 
 // Caller should free returned string
@@ -746,6 +758,33 @@ test "include path 2" {
     const output = try generateAccessorsString(std.testing.allocator, code, .{
         .generate_body = false,
         .include_path = &[_][]const u8{"test"},
+    });
+
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "prepend and append string" {
+    const code: []const u8 =
+        \\void foo(int x) { return x+1; }
+    ;
+
+    const expected =
+        \\//generated, do not edit!
+        \\
+        \\void foo(int x);
+        \\
+        \\//EOF
+    ;
+
+    const output = try generateProtoString(std.testing.allocator, code, .{
+        .include_path = &[_][]const u8{"test"},
+        .prepend_str = "//generated, do not edit!\n\n",
+        .append_str = "//EOF\n",
     });
 
     defer std.testing.allocator.free(output);
