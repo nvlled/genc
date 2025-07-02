@@ -7,7 +7,12 @@ pub fn build(b: *std.Build) void {
     const aro = b.dependency("aro", .{
         .target = target,
         .optimize = optimize,
-    }).module("aro");
+    });
+
+    const intf = b.dependency("intf", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.addModule("genc", .{
         .root_source_file = b.path("src/root.zig"),
@@ -15,7 +20,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{
                 .name = "aro",
-                .module = aro,
+                .module = aro.module("aro"),
+            },
+            .{
+                .name = "intf",
+                .module = intf.module("intf"),
             },
         },
     });

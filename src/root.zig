@@ -1,5 +1,6 @@
 const std = @import("std");
 const aro = @import("aro");
+const intf = @import("intf");
 const Node = aro.Tree.Node;
 const stderr = std.io.getStdErr().writer();
 
@@ -28,12 +29,18 @@ pub const FuncFilter = struct {
     predicate: *const fn (item: FuncItem, context: *anyopaque) bool,
 };
 
+const OutputOption = @FieldType(aro.Diagnostics, "output");
+
 pub const AccessorOptions = struct {
     filter: ?StructFilter = null,
     generate_body: bool = true,
     include_path: []const []const u8 = &.{},
     prepend_str: []const u8 = &.{},
     append_str: []const u8 = &.{},
+    output: OutputOption = .{ .to_file = .{
+        .file = std.io.getStdErr(),
+        .config = .escape_codes,
+    } },
 };
 
 pub const ProtoOptions = struct {
@@ -41,9 +48,19 @@ pub const ProtoOptions = struct {
     include_path: []const []const u8 = &.{},
     prepend_str: []const u8 = &.{},
     append_str: []const u8 = &.{},
+    output: OutputOption = .{ .to_file = .{
+        .file = std.io.getStdErr(),
+        .config = .escape_codes,
+    } },
 };
 
-fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: anytype, generate_body: bool) !void {
+fn generateStructAccessors(
+    comptime WT: type,
+    tree: *const aro.Tree,
+    node_index: Node.Index,
+    w: intf.io.Writer(WT),
+    generate_body: bool,
+) !void {
     const struct_node = node_index.get(tree);
     const decl: Node.ContainerDecl = val: switch (struct_node) {
         else => return,
@@ -79,11 +96,11 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
                 }
 
                 if (prev_field) |f| {
-                    try generateSubAccessors(tree, f, w, .{
-                        .struct_name = struct_name,
-                        .field_names = &field_names,
-                        .type_name_buf = &type_name_buf,
-                        .generate_body = generate_body,
+                    try generateSubAccessors(WT, tree, f, w, .{
+                        struct_name,
+                        &field_names,
+                        &type_name_buf,
+                        generate_body,
                     });
                     prev_field = null;
                     continue :loop;
@@ -121,16 +138,19 @@ fn generateStructAccessors(tree: *const aro.Tree, node_index: Node.Index, w: any
     }
 }
 
-fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: struct {
-    struct_name: []const u8,
-    field_names: *std.BoundedArray(String, field_names_buf_size),
-    type_name_buf: *std.io.StreamSource,
-    generate_body: bool,
-}) !void {
-    const struct_name = args.struct_name;
-    const field_names = args.field_names;
-    const type_name_buf = args.type_name_buf;
-    const generate_body = args.generate_body;
+fn generateSubAccessors(
+    comptime WT: type,
+    tree: *const aro.Tree,
+    node: Node,
+    w: intf.io.Writer(WT),
+    args: struct {
+        []const u8,
+        *std.BoundedArray(String, field_names_buf_size),
+        *std.io.StreamSource,
+        bool,
+    },
+) !void {
+    const struct_name, const field_names, const type_name_buf, const generate_body = args;
 
     const container: Node.ContainerDecl = blk: switch (node) {
         .struct_decl, .enum_decl, .union_decl => |f| {
@@ -159,14 +179,14 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
                 if (prev_field) |f| {
                     const n = field_names.len;
                     // error can't happen since n is guaranteed <= max_capacity
-                    defer field_names.resize(n) catch {};
+                    defer field_names.resize(n) catch unreachable;
                     try field_names.append(ident);
 
-                    try generateSubAccessors(tree, f, w, .{
-                        .struct_name = struct_name,
-                        .field_names = field_names,
-                        .type_name_buf = type_name_buf,
-                        .generate_body = generate_body,
+                    try generateSubAccessors(WT, tree, f, w, .{
+                        struct_name,
+                        field_names,
+                        type_name_buf,
+                        generate_body,
                     });
                     prev_field = null;
                     continue :loop;
@@ -223,16 +243,24 @@ fn generateSubAccessors(tree: *const aro.Tree, node: Node, w: anytype, args: str
     }
 }
 
-pub fn generateAccessors(allocator: std.mem.Allocator, r: anytype, w: anytype, options: AccessorOptions) !void {
-    var diagnostics: aro.Diagnostics = .{ .output = .ignore };
+pub fn generateAccessors(
+    comptime RT: type,
+    comptime WT: type,
+    allocator: std.mem.Allocator,
+    r: intf.io.Reader(RT),
+    w: intf.io.Writer(WT),
+    options: AccessorOptions,
+) !void {
+    var diagnostics: aro.Diagnostics = .{ .output = options.output };
     var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
     defer comp.deinit();
 
     for (options.include_path) |path| {
-        try comp.include_dirs.append(allocator, path);
+        try comp.addSystemIncludeDir(path);
     }
 
-    const file = try comp.addSourceFromReader(r, "file.c", .user);
+    const rr = RemoveIncludes.Wrap(RT).init(r);
+    const file = try comp.addSourceFromReader(rr.reader(), "file.c", .user);
     const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
 
     var pp = aro.Preprocessor.init(&comp, .default);
@@ -265,23 +293,35 @@ pub fn generateAccessors(allocator: std.mem.Allocator, r: anytype, w: anytype, o
             if (!include) continue :loop;
         }
 
-        try generateStructAccessors(&tree, node, w, options.generate_body);
+        try generateStructAccessors(WT, &tree, node, w, options.generate_body);
     }
 
     try w.writeAll(options.append_str);
 }
 
-pub fn generateProto(allocator: std.mem.Allocator, r: anytype, w: anytype, options: ProtoOptions) !void {
-    var diagnostics: aro.Diagnostics = .{ .output = .ignore };
+pub fn generateProto(
+    comptime RT: type,
+    comptime WT: type,
+    allocator: std.mem.Allocator,
+    r: intf.io.Reader(RT),
+    w: intf.io.Writer(WT),
+    options: ProtoOptions,
+) !void {
+    var diagnostics: aro.Diagnostics = .{ .output = options.output };
     var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
     defer comp.deinit();
 
-    comp.langopts.preserve_comments = true;
+    // TODO: preserve function comments
+    // Currently preserve_comments only works for the preprocessing step:
+    // https://github.com/Vexu/arocc/issues/871
+    //comp.langopts.preserve_comments = true;
+
     for (options.include_path) |path| {
-        try comp.include_dirs.append(allocator, path);
+        try comp.addSystemIncludeDir(path);
     }
 
-    const file = try comp.addSourceFromReader(r, "file.c", .user);
+    const rr = RemoveIncludes.Wrap(RT).init(r);
+    const file = try comp.addSourceFromReader(rr.reader(), "file.c", .user);
     const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
     var pp = aro.Preprocessor.init(&comp, .default);
 
@@ -367,8 +407,8 @@ pub fn generateAccessorsString(allocator: std.mem.Allocator, code: String, optio
 
     var w = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(buffer[0..]) };
     var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
-    try generateAccessors(allocator, r.reader(), w.writer(), options);
 
+    try generateAccessors(@TypeOf(r), @TypeOf(w), allocator, r.reader(), w.writer(), options);
     return allocator.dupe(u8, w.buffer.getWritten());
 }
 
@@ -380,7 +420,7 @@ pub fn generateProtoString(allocator: std.mem.Allocator, code: String, options: 
 
     var w = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(buffer[0..]) };
     var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
-    try generateProto(allocator, r.reader(), w.writer(), options);
+    try generateProto(@TypeOf(r), @TypeOf(w), allocator, r.reader(), w.writer(), options);
 
     return allocator.dupe(u8, w.buffer.getWritten());
 }
@@ -668,24 +708,13 @@ test "filter by struct with bitfields" {
 
 test "generateProto" {
     const code: []const u8 =
-        \\// this is foo function
-        \\// it adds two number
         \\int foo(int x, int y) { return x+y; }
-        \\/** bar does something
-        \\    but returns nothing
-        \\*/
         \\void bar(char z) { }
         \\void baz() { }
-        \\/*end of file*/
     ;
     const expected =
-        \\// this is foo function
-        \\// it adds two number
         \\int foo(int x, int y);
         \\
-        \\/** bar does something
-        \\    but returns nothing
-        \\*/
         \\void bar(char z);
         \\
         \\void baz();
@@ -699,6 +728,41 @@ test "generateProto" {
         std.mem.trim(u8, expected, "\n "),
     );
 }
+
+// TODO:
+//test "generateProto with comments" {
+//    const code: []const u8 =
+//        \\// this is foo function
+//        \\// it adds two number
+//        \\int foo(int x, int y) { return x+y; }
+//        \\/** bar does something
+//        \\    but returns nothing
+//        \\*/
+//        \\void bar(char z) { }
+//        \\void baz() { }
+//        \\/*end of file*/
+//    ;
+//    const expected =
+//        \\// this is foo function
+//        \\// it adds two number
+//        \\int foo(int x, int y);
+//        \\
+//        \\/** bar does something
+//        \\    but returns nothing
+//        \\*/
+//        \\void bar(char z);
+//        \\
+//        \\void baz();
+//    ;
+//
+//    const output = try generateProtoString(std.testing.allocator, code, .{});
+//    defer std.testing.allocator.free(output);
+//
+//    try std.testing.expectEqualStrings(
+//        std.mem.trim(u8, output, "\n "),
+//        std.mem.trim(u8, expected, "\n "),
+//    );
+//}
 
 test "generateProto with filter" {
     const code: []const u8 =
@@ -746,7 +810,7 @@ test "include path 1" {
     ;
 
     const output = try generateProtoString(std.testing.allocator, code, .{
-        .include_path = &[_][]const u8{"test"},
+        .include_path = &.{"test"},
     });
     defer std.testing.allocator.free(output);
 
@@ -759,6 +823,7 @@ test "include path 1" {
 test "include path 2" {
     const code: []const u8 =
         \\#include "struct.h"
+        \\#include <stdio.h>
     ;
 
     const expected =
@@ -771,7 +836,7 @@ test "include path 2" {
 
     const output = try generateAccessorsString(std.testing.allocator, code, .{
         .generate_body = false,
-        .include_path = &[_][]const u8{"test"},
+        .include_path = &.{"test"},
     });
 
     defer std.testing.allocator.free(output);
@@ -782,15 +847,103 @@ test "include path 2" {
     );
 }
 
+/// A set of functions that replaces #includes<...>
+/// with an empty line from a string or reader.
+/// This is because of I'm getting weird
+/// errors related to headers not being found by aroccc,
+/// despite setting up my path correctly and zig
+/// finds the headers just fine. Probably a bug,
+/// or I misconfigured something. In any case,
+/// system headers aren't really needed since
+/// only the file itself needs to be parsed.
+/// So as a workaround, just filter those lines out.
+const RemoveIncludes = struct {
+    pub fn Wrap(comptime T: type) type {
+        return struct {
+            const Self = @This();
+
+            r: intf.io.Reader(T),
+
+            pub fn read(self: *const Self, buf: []u8) anyerror!usize {
+                var line_buf: [4096]u8 = undefined;
+
+                while (true) {
+                    const line = try self.r.readUntilDelimiterOrEof(&line_buf, '\n') orelse {
+                        break;
+                    };
+
+                    if (isSystemInclude(line)) {
+                        buf[0] = '\n';
+                        return 1;
+                    } else {
+                        @memcpy(buf[0..line.len], line);
+                        buf[line.len] = '\n';
+                        return line.len + 1; // +1 for the newline
+                    }
+                }
+                return 0;
+            }
+
+            pub fn reader(self: *const Self) intf.io.Reader(Self) {
+                return .{
+                    .context = self,
+                };
+            }
+
+            pub fn init(r: intf.io.Reader(T)) Self {
+                return .{ .r = r };
+            }
+        };
+    }
+
+    pub fn pipe(
+        comptime RT: type,
+        comptime WT: type,
+        r: intf.io.Reader(RT),
+        w: intf.io.Writer(WT),
+    ) !void {
+        var buf: [4096]u8 = undefined;
+
+        while (true) {
+            if (try r.readUntilDelimiterOrEof(&buf, '\n')) |line| {
+                if (!isSystemInclude(line)) {
+                    _ = try w.writeAll(line);
+                    _ = try w.writeByte('\n');
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Caller should free returned string
+    pub fn byString(allocator: std.mem.Allocator, c_code: []const u8) ![]const u8 {
+        var buf = std.ArrayList(u8).init(allocator);
+        var iter = std.mem.tokenizeScalar(u8, c_code, '\n');
+        while (iter.next()) |line| {
+            if (isSystemInclude(line)) continue;
+            try buf.appendSlice(line);
+            try buf.append('\n');
+        }
+        return try buf.toOwnedSlice();
+    }
+
+    fn isSystemInclude(s: []const u8) bool {
+        if (!std.mem.startsWith(u8, s, "#include")) return false;
+        const line = std.mem.trimStart(u8, s["#include".len..], " ");
+        return line.len > 0 and line[0] == '<';
+    }
+};
+
 test "prepend and append string" {
     const code: []const u8 =
-        \\void foo(int x) { return x+1; }
+        \\int foo(int x) { return x+1; }
     ;
 
     const expected =
         \\//generated, do not edit!
         \\
-        \\void foo(int x);
+        \\int foo(int x);
         \\
         \\//EOF
     ;
@@ -807,4 +960,57 @@ test "prepend and append string" {
         std.mem.trim(u8, output, "\n "),
         std.mem.trim(u8, expected, "\n "),
     );
+}
+
+test "remove includes by string" {
+    const code =
+        \\#include <stdio.h>
+        \\#define X 100
+        \\void foo() { }
+        \\#include <bfd.h>
+        \\void bar() { }
+        \\// this one is fine
+    ;
+    const expected =
+        \\#define X 100
+        \\void foo() { }
+        \\void bar() { }
+        \\// this one is fine
+    ;
+
+    const output = try RemoveIncludes.byString(std.testing.allocator, code);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, output, "\n "),
+        std.mem.trim(u8, expected, "\n "),
+    );
+}
+
+test "remove includes by wrapping" {
+    const code =
+        \\#include <stdio.h>
+        \\#define X 100
+        \\void foo() { }
+        \\#include <bfd.h>
+        \\void bar() { }
+        \\// some comment
+    ;
+
+    var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
+
+    const expected =
+        \\
+        \\#define X 100
+        \\void foo() { }
+        \\
+        \\void bar() { }
+        \\// some comment
+    ;
+
+    const rr = RemoveIncludes.Wrap(@TypeOf(r)).init(r.reader()).reader();
+    const str = try rr.readAllAlloc(std.testing.allocator, std.math.maxInt(u8));
+    defer std.testing.allocator.free(str);
+    const output = std.mem.trimEnd(u8, str, "\n ");
+
+    try std.testing.expectEqualStrings(expected, output);
 }

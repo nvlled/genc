@@ -8,6 +8,10 @@
             .url = "git+https://github.com/Vexu/arocc.git#0a1bafae3f12a29c65b0cfd91f138c038cc04d34",
             .hash = "aro-0.0.0-JSD1QowDJwDniRbMfnQ6kvt5_4aBVpUetJvLWg0gFHyS",
         },
+        .intf = .{
+            .url = "https://github.com/nvlled/zig-intf/archive/refs/heads/main.tar.gz",
+            .hash = "intf-0.0.0-Fj_qm5VoAADERaFPR-K7XjKVysObVMI8xe6eb0n4NfDh",
+        },
     },
     .paths = .{
         "build.zig",
