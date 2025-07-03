@@ -792,59 +792,6 @@ test "generateProto with filter" {
     );
 }
 
-test "include path 1" {
-    const code: []const u8 =
-        \\#include "funcs.h"
-    ;
-
-    const expected =
-        \\int f1(int x, int y);
-        \\
-        \\int f2(int x, int y);
-        \\
-        \\int f3(int x, int y);
-        \\
-        \\int f4(int x, int y);
-    ;
-
-    const output = try generateProtoString(std.testing.allocator, code, .{
-        .include_path = &.{"test"},
-    });
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "include path 2" {
-    const code: []const u8 =
-        \\#include "struct.h"
-        \\#include <stdio.h>
-    ;
-
-    const expected =
-        \\int Foo_get_x(const struct Foo *self);
-        \\
-        \\int Foo_get_y(const struct Foo *self);
-        \\
-        \\int Foo_get_z(const struct Foo *self);
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{
-        .generate_body = false,
-        .include_path = &.{"test"},
-    });
-
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
 /// A set of functions that replaces #includes<...>
 /// with an empty line from a string or reader.
 /// This is because of I'm getting weird
@@ -884,7 +831,7 @@ const RemoveIncludes = struct {
                         break;
                     };
 
-                    if (isSystemInclude(line)) {
+                    if (isInclude(line)) {
                         buf[0] = '\n';
                         return 1;
                     } else if (line.len >= buf.len) {
@@ -922,7 +869,7 @@ const RemoveIncludes = struct {
 
         while (true) {
             if (try r.readUntilDelimiterOrEof(&buf, '\n')) |line| {
-                if (!isSystemInclude(line)) {
+                if (!isInclude(line)) {
                     _ = try w.writeAll(line);
                     _ = try w.writeByte('\n');
                 }
@@ -937,17 +884,15 @@ const RemoveIncludes = struct {
         var buf = std.ArrayList(u8).init(allocator);
         var iter = std.mem.tokenizeScalar(u8, c_code, '\n');
         while (iter.next()) |line| {
-            if (isSystemInclude(line)) continue;
+            if (isInclude(line)) continue;
             try buf.appendSlice(line);
             try buf.append('\n');
         }
         return try buf.toOwnedSlice();
     }
 
-    fn isSystemInclude(s: []const u8) bool {
-        if (!std.mem.startsWith(u8, s, "#include")) return false;
-        const line = std.mem.trimStart(u8, s["#include".len..], " ");
-        return line.len > 0 and line[0] == '<';
+    fn isInclude(s: []const u8) bool {
+        return std.mem.startsWith(u8, s, "#include");
     }
 };
 
