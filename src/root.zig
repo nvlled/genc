@@ -259,7 +259,7 @@ pub fn generateAccessors(
         try comp.addSystemIncludeDir(path);
     }
 
-    const rr = RemoveIncludes.Wrap(RT).init(r);
+    var rr = RemoveIncludes.Wrap(RT).init(r);
     const file = try comp.addSourceFromReader(rr.reader(), "file.c", .user);
     const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
 
@@ -320,7 +320,7 @@ pub fn generateProto(
         try comp.addSystemIncludeDir(path);
     }
 
-    const rr = RemoveIncludes.Wrap(RT).init(r);
+    var rr = RemoveIncludes.Wrap(RT).init(r);
     const file = try comp.addSourceFromReader(rr.reader(), "file.c", .user);
     const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
     var pp = aro.Preprocessor.init(&comp, .default);
@@ -401,15 +401,13 @@ pub fn generateProto(
 
 // Caller should free returned string
 pub fn generateAccessorsString(allocator: std.mem.Allocator, code: String, options: AccessorOptions) !String {
-    const len: f32 = @floatFromInt(code.len);
-    var buffer = try allocator.alloc(u8, @intFromFloat(@ceil(len / 1024) * 1024 * 2));
-    defer allocator.free(buffer);
+    var w = std.ArrayList(u8).init(allocator);
+    var r = std.io.fixedBufferStream(code);
 
-    var w = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(buffer[0..]) };
-    var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
+    defer w.deinit();
 
     try generateAccessors(@TypeOf(r), @TypeOf(w), allocator, r.reader(), w.writer(), options);
-    return allocator.dupe(u8, w.buffer.getWritten());
+    return try w.toOwnedSlice();
 }
 
 // Caller should free returned string
@@ -863,18 +861,36 @@ const RemoveIncludes = struct {
             const Self = @This();
 
             r: intf.io.Reader(T),
+            line_buf: [4096]u8 = undefined,
+            leftover: ?[]u8 = null,
 
-            pub fn read(self: *const Self, buf: []u8) anyerror!usize {
-                var line_buf: [4096]u8 = undefined;
+            pub fn read(self: *Self, buf: []u8) anyerror!usize {
+                if (self.leftover) |line| {
+                    if (line.len >= buf.len) { // -1 for the newline
+                        @memcpy(buf, line[0..buf.len]);
+                        self.leftover = line[buf.len..];
+                        return buf.len;
+                    } else {
+                        @memcpy(buf[0..line.len], line);
+                        buf[line.len] = '\n';
+                        self.leftover = null;
+                        return line.len + 1; // +1 for the newline
+                    }
+                }
 
                 while (true) {
-                    const line = try self.r.readUntilDelimiterOrEof(&line_buf, '\n') orelse {
+                    // TODO: fix added extra line at EOF
+                    const line = try self.r.readUntilDelimiterOrEof(&self.line_buf, '\n') orelse {
                         break;
                     };
 
                     if (isSystemInclude(line)) {
                         buf[0] = '\n';
                         return 1;
+                    } else if (line.len >= buf.len) {
+                        @memcpy(buf, line[0..buf.len]);
+                        self.leftover = line[buf.len..];
+                        return buf.len;
                     } else {
                         @memcpy(buf[0..line.len], line);
                         buf[line.len] = '\n';
@@ -884,7 +900,7 @@ const RemoveIncludes = struct {
                 return 0;
             }
 
-            pub fn reader(self: *const Self) intf.io.Reader(Self) {
+            pub fn reader(self: *Self) intf.io.Reader(Self) {
                 return .{
                     .context = self,
                 };
@@ -1007,10 +1023,40 @@ test "remove includes by wrapping" {
         \\// some comment
     ;
 
-    const rr = RemoveIncludes.Wrap(@TypeOf(r)).init(r.reader()).reader();
-    const str = try rr.readAllAlloc(std.testing.allocator, std.math.maxInt(u8));
+    var rr = RemoveIncludes.Wrap(@TypeOf(r)).init(r.reader());
+    const str = try rr.reader().readAllAlloc(std.testing.allocator, std.math.maxInt(u8));
     defer std.testing.allocator.free(str);
     const output = std.mem.trimEnd(u8, str, "\n ");
 
     try std.testing.expectEqualStrings(expected, output);
+}
+
+test "remove includes by wrapping with tiny and large buffer" {
+    const input = "abcdefghijklmno\npqrstuvwxyz";
+    var r = std.io.fixedBufferStream(input);
+    var temp = RemoveIncludes.Wrap(@TypeOf(r)).init(r.reader());
+    var reader = temp.reader();
+
+    var buf: [5]u8 = undefined;
+    var n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("abcde", buf[0..n]);
+    n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("fghij", buf[0..n]);
+    n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("klmno", buf[0..n]);
+    n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("\n", buf[0..n]);
+    n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("pqrst", buf[0..n]);
+    n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("uvwxy", buf[0..n]);
+    n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("z\n", buf[0..n]);
+
+    var buf_large: [100]u8 = undefined;
+    try r.seekTo(0);
+    n = try reader.read(&buf_large);
+    try std.testing.expectEqualStrings("abcdefghijklmno\n", buf_large[0..n]);
+    n = try reader.read(&buf_large);
+    try std.testing.expectEqualStrings("pqrstuvwxyz\n", buf_large[0..n]);
 }
