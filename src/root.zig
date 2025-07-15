@@ -1,441 +1,750 @@
 const std = @import("std");
-const aro = @import("aro");
+const stderr = std.io.getStdErr();
+const ts = @import("tree-sitter");
 const intf = @import("intf");
-const Node = aro.Tree.Node;
-const stderr = std.io.getStdErr().writer();
-
 const String = []const u8;
 
-const field_names_buf_size = 128;
+// TODO: use new io
 
-pub const StructItem = struct {
-    name: String,
-    has_bitfields: bool = false,
+pub extern fn tree_sitter_c() callconv(.C) *const ts.Language;
+
+const Kind = enum(u16) {
+    unknown = 0,
+    identifier = 1,
+    primitive_type = 93,
+    pointer = 96,
+    system_lib_string = 155,
+    comment = 160,
+    preproc_include = 164,
+    function_definition = 196,
+    declaration = 198,
+    type_definition = 199,
+    parenthesized_declarator = 219,
+    pointer_declarator = 226,
+    function_declarator = 230,
+    compound_statement = 241,
+    storage_class_specifier = 242,
+    enum_specifier = 247,
+    struct_specifier = 249,
+    union_specifier = 250,
+    field_declaration_list = 251,
+    field_declaration = 253,
+    bitfield_clause = 255,
+    parameter_list = 258,
+    for_statement = 273,
+    expression_statement = 266,
+    string_literal = 320,
+    macro_type_specifier = 323,
+    field_identifier = 360,
+    type_identifier = 362,
+
+    // TODO: log a message when this kind is encountered
+    ERROR = 65535,
+
+    fn get(maybeNode: ?ts.Node) !Kind {
+        const node = maybeNode orelse return Kind.unknown;
+        return std.meta.intToEnum(Kind, node.kindId()) catch |err| {
+            std.debug.print("unregistered node kind: {s} = {d}\n", .{ node.kind(), node.kindId() });
+            return err;
+        };
+    }
+};
+
+const StorateClassSpec = enum {
+    unknown,
+    @"inline",
+    static,
+    @"extern",
+};
+
+const FuncFlags = packed struct(u3) {
+    is_inline: bool = false,
+    is_static: bool = false,
+    is_extern: bool = false,
 };
 
 pub const FuncItem = struct {
     name: String,
-    @"inline": bool,
-    static: bool,
+    flags: FuncFlags,
 };
 
-pub const StructFilter = struct {
-    context: *anyopaque = undefined,
-    predicate: *const fn (item: StructItem, context: *anyopaque) bool,
-};
+pub const StructItem = struct {
+    name: String,
 
-pub const FuncFilter = struct {
-    context: *anyopaque = undefined,
-    predicate: *const fn (item: FuncItem, context: *anyopaque) bool,
-};
+    // internal use only, no touchie, authorized personnel only
+    // bathroom is that way
+    _context: *const anyopaque = undefined,
 
-const OutputOption = @FieldType(aro.Diagnostics, "output");
+    const Self = @This();
 
-pub const AccessorOptions = struct {
-    filter: ?StructFilter = null,
-    generate_body: bool = true,
-    include_path: []const []const u8 = &.{},
-    prepend_str: []const u8 = &.{},
-    append_str: []const u8 = &.{},
-    output: OutputOption = .{ .to_file = .{
-        .file = std.io.getStdErr(),
-        .config = .escape_codes,
-    } },
-};
+    // since this is somewhat an expensive search
+    // use a function instead of a flag to lazily search
+    // only when required.
+    fn hasBitFields(self: Self) bool {
+        const struct_body: *const ts.Node = @alignCast(@ptrCast(self._context));
 
-pub const ProtoOptions = struct {
-    filter: ?FuncFilter = null,
-    include_path: []const []const u8 = &.{},
-    prepend_str: []const u8 = &.{},
-    append_str: []const u8 = &.{},
-    output: OutputOption = .{ .to_file = .{
-        .file = std.io.getStdErr(),
-        .config = .escape_codes,
-    } },
-};
+        var field_iter = struct_body.iterateChildren();
+        defer field_iter.destroy();
 
-fn generateStructAccessors(
-    comptime WT: type,
-    tree: *const aro.Tree,
-    node_index: Node.Index,
-    w: intf.io.Writer(WT),
-    generate_body: bool,
-) !void {
-    const struct_node = node_index.get(tree);
-    const decl: Node.ContainerDecl = val: switch (struct_node) {
-        else => return,
-        .struct_decl => |decl| break :val decl,
-    };
+        while (field_iter.nextNamed()) |field_decl| {
+            // ignore intToEnum parse errors
+            if ((Kind.get(field_decl) catch Kind.unknown) != .field_declaration) continue;
 
-    const struct_name = tree.tokSlice(decl.name_or_kind_tok);
-
-    var buffer: [1024]u8 = undefined;
-    var type_name_buf = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(&buffer) };
-
-    var prev_field: ?Node = null;
-    loop: for (decl.fields) |field| {
-        const sub_node = field.get(tree);
-        const record: Node.RecordField = val: switch (sub_node) {
-            else => continue :loop,
-            .union_decl, .struct_decl, .enum_decl => {
-                prev_field = sub_node;
-                continue :loop;
-            },
-            .record_field => |r| break :val r,
-        };
-
-        const ident = tree.tokSlice(record.name_or_first_tok);
-        var is_pointer = false;
-
-        switch (record.qt.type(tree.comp)) {
-            .@"union", .@"enum", .@"struct" => {
-                var field_names = try std.BoundedArray(String, field_names_buf_size).init(0);
-
-                if (!std.mem.eql(u8, ident, "struct")) {
-                    try field_names.append(ident);
-                }
-
-                if (prev_field) |f| {
-                    try generateSubAccessors(WT, tree, f, w, .{
-                        struct_name,
-                        &field_names,
-                        &type_name_buf,
-                        generate_body,
-                    });
-                    prev_field = null;
-                    continue :loop;
-                }
-            },
-            .pointer => |p| {
-                is_pointer = true;
-                switch (p.child.type(tree.comp)) {
-                    .@"struct", .@"union" => |s| {
-                        // when the field is a pointer to an anonymous struct,
-                        // skip it, since the type shows "(anonymous TAG at path:line:col)",
-                        // which is not a valid C type.
-                        if (s.isAnonymous(tree.comp)) continue :loop;
-                    },
-                    else => {},
-                }
-            },
-            else => {},
+            if (field_decl.namedChild(2)) |n| {
+                return (Kind.get(n) catch Kind.unknown) == .bitfield_clause;
+            }
         }
 
-        try type_name_buf.seekTo(0);
-        try record.qt.print(tree.comp, type_name_buf.writer());
-        const type_str = type_name_buf.buffer.getWritten();
-        const return_type_space = if (is_pointer) "" else " ";
-
-        if (generate_body) try w.writeAll("extern inline ");
-
-        try w.print("{s}{s}{s}_get_{s}(const struct {s} *self)", .{ type_str, return_type_space, struct_name, ident, struct_name });
-        if (generate_body) {
-            try w.print(" {{ return self->{s}; }}\n", .{ident});
-        } else {
-            try w.writeAll(";\n");
-        }
-        try w.writeAll("\n");
+        return false;
     }
-}
+};
 
-fn generateSubAccessors(
-    comptime WT: type,
-    tree: *const aro.Tree,
-    node: Node,
-    w: intf.io.Writer(WT),
-    args: struct {
-        []const u8,
-        *std.BoundedArray(String, field_names_buf_size),
-        *std.io.StreamSource,
-        bool,
-    },
-) !void {
-    const struct_name, const field_names, const type_name_buf, const generate_body = args;
+// To make more sense of the dump functions, you need to understand
+// the overall node tree (and pecularities) created by the language parser.
+//
+// To view a node tree, either use Tree.printDotGraph or Node.writeJSON:
+//
+//    try node.writeJSON(stderr.writer().any(), .{ .source = source });
+//
+// To view the whole tree starting from the root, set the option
+//
+//     .{ .debug_tree = true }
 
-    const container: Node.ContainerDecl = blk: switch (node) {
-        .struct_decl, .enum_decl, .union_decl => |f| {
-            break :blk f;
-        },
-        else => return,
+const GenAccessors = struct {
+    source: []const u8,
+    options: Options = .{},
+
+    const Self = @This();
+
+    const Options = struct {
+        retain_includes: bool = false,
+        func_prototype: bool = false,
+        prepend_str: []const u8 = &.{},
+        append_str: []const u8 = &.{},
+        filter: ?Filter = null,
+        debug_tree: bool = false,
     };
 
-    var prev_field: ?Node = null;
-    loop: for (container.fields) |field| {
-        const sub_node = field.get(tree);
-        const record: Node.RecordField = val: switch (sub_node) {
-            else => continue :loop,
-            .union_decl, .struct_decl, .enum_decl => {
-                prev_field = sub_node;
-                continue :loop;
-            },
-            .record_field => |r| break :val r,
-        };
+    const Filter = struct {
+        context: *anyopaque = undefined,
+        predicate: *const fn (context: *anyopaque, item: StructItem) bool,
+    };
 
-        const ident = tree.tokSlice(record.name_or_first_tok);
-        var is_pointer = false;
+    fn accessors(
+        self: Self,
+        w: std.io.AnyWriter,
+        options: Options,
+    ) !void {
+        const source = self.source;
+        const language = tree_sitter_c();
+        defer language.destroy();
 
-        switch (record.qt.type(tree.comp)) {
-            .@"union", .@"enum", .@"struct" => {
-                if (prev_field) |f| {
-                    const n = field_names.len;
-                    // error can't happen since n is guaranteed <= max_capacity
-                    defer field_names.resize(n) catch unreachable;
-                    try field_names.append(ident);
+        std.debug.assert(language.abiVersion() == ts.LANGUAGE_VERSION);
+        const parser = ts.Parser.create();
+        defer parser.destroy();
+        try parser.setLanguage(language);
 
-                    try generateSubAccessors(WT, tree, f, w, .{
-                        struct_name,
-                        field_names,
-                        type_name_buf,
-                        generate_body,
-                    });
-                    prev_field = null;
-                    continue :loop;
-                }
-            },
-            .pointer => |p| {
-                is_pointer = true;
-                switch (p.child.type(tree.comp)) {
-                    .@"struct", .@"union" => |s| {
-                        // when the field is a pointer to an anonymous struct,
-                        // skip it, since the type shows "(anonymous TAG at path:line:col)",
-                        // which is not a valid C type.
-                        if (s.isAnonymous(tree.comp)) continue :loop;
-                    },
-                    else => {},
-                }
-            },
-            else => {},
+        const tree = parser.parseString(source, null) orelse @panic("failed to parse");
+        defer tree.destroy();
+
+        const root = tree.rootNode();
+        var iter_children = root.iterateChildren();
+        defer iter_children.destroy();
+
+        if (options.debug_tree) try root.writeJSON(stderr.writer().any(), .{ .source = source });
+
+        var i: usize = 0;
+        while (iter_children.nextNamed()) |node| {
+            defer i += 1;
+            const kind: Kind = try .get(node);
+
+            switch (kind) {
+                .preproc_include => {
+                    if (options.retain_includes) {
+                        try dumpInclude(source, w, node);
+                        try w.writeAll("\n\n");
+                    }
+                },
+
+                .struct_specifier => {
+                    const ok = try self.dumpStructAccessors(w, node);
+                    if (ok) try w.writeAll("\n\n");
+                },
+
+                else => {},
+            }
+        }
+    }
+
+    fn dumpStructAccessors(
+        self: Self,
+        w: std.io.AnyWriter,
+        struct_spec: ts.Node,
+    ) !bool {
+        const source = self.source;
+        const options = self.options;
+
+        std.debug.assert(try Kind.get(struct_spec) == .struct_specifier);
+        std.debug.assert(struct_spec.childCount() >= 3);
+        const struct_name = struct_spec.child(1).?.raw(source);
+        const struct_body = struct_spec.child(2).?;
+        std.debug.assert(try Kind.get(struct_body) == .field_declaration_list);
+
+        if (options.filter) |filter| {
+            const item = StructItem{
+                .name = struct_name,
+                ._context = @ptrCast(&struct_body),
+            };
+
+            const ok = filter.predicate(filter.context, item);
+            if (!ok) return false;
         }
 
-        try type_name_buf.seekTo(0);
-        try record.qt.print(tree.comp, type_name_buf.writer());
+        var field_iter = struct_body.iterateChildren();
+        defer field_iter.destroy();
 
-        const type_str = type_name_buf.buffer.getWritten();
+        while (field_iter.nextNamed()) |field_decl| {
+            if (try Kind.get(field_decl) != .field_declaration) continue;
 
-        if (generate_body) try w.writeAll("extern inline ");
+            const ftype = field_decl.namedChild(0).?;
+            const second_child = field_decl.namedChild(1) orelse {
+                // field has no identifier
+                continue;
+            };
 
-        try w.writeAll(type_str);
-        if (!is_pointer) try w.writeAll(" ");
-        try w.writeAll(struct_name);
-        try w.writeAll("_get");
-        for (field_names.slice()) |f| {
+            const identifier, const ptr_count = try unwrapPointerDeclarators(second_child);
+
+            if (try isFieldAnonContainer(field_decl)) {
+                // skip if it's a pointer to anonymous struct or union
+                if (ptr_count > 0) continue;
+
+                const c = ftype.child(1).?;
+                var iter = c.iterateChildren();
+                defer iter.destroy();
+
+                while (iter.nextNamed()) |sub_field_decl| {
+                    if (try Kind.get(sub_field_decl) != .field_declaration) continue;
+
+                    // Do not recursively descend into madness of nested anonymous structs
+                    // Even if C and the Law allows it, I won't
+                    // (or rather I just want to keep it simple for now)
+                    if (try isFieldAnonContainer(sub_field_decl)) continue;
+
+                    const sub_ftype = sub_field_decl.namedChild(0).?;
+                    const sub_child = sub_field_decl.namedChild(1) orelse {
+                        // field has no identifier
+                        continue;
+                    };
+                    const sub_identifier, const sub_ptr_count = try unwrapPointerDeclarators(sub_child);
+
+                    try writeAccessor(
+                        .{
+                            .w = w,
+                            .return_type = sub_ftype.raw(source),
+                            .ptr_count = sub_ptr_count,
+                            .struct_name = struct_name,
+                            .prop_name = sub_identifier.raw(source),
+                            .namespace = identifier.raw(source),
+                            .prototype = options.func_prototype,
+                        },
+                    );
+                }
+            } else {
+                try writeAccessor(.{
+                    .w = w,
+                    .return_type = ftype.raw(source),
+                    .ptr_count = ptr_count,
+                    .struct_name = struct_name,
+                    .prop_name = identifier.raw(source),
+                    .prototype = options.func_prototype,
+                });
+            }
+        }
+
+        return true;
+    }
+
+    /// Returns true if field declaration is
+    /// an anonymous struct, union or even enum,
+    ///
+    /// ```
+    /// struct A {
+    ///     int regularField;
+    ///     union { int x; } fieldDecl1;  // anonymous union
+    ///     struct { int x; } fieldDecl2; // anonymous struct
+    /// }
+    /// ```
+    fn isFieldAnonContainer(field_decl: ts.Node) !bool {
+        const ftype = field_decl.namedChild(0) orelse return false;
+
+        if (ftype.child(1)) |c| {
+            return try Kind.get(c) == .field_declaration_list;
+        }
+        return false;
+    }
+
+    fn writeAccessor(args: struct {
+        w: std.io.AnyWriter,
+        return_type: []const u8,
+        ptr_count: usize,
+        struct_name: []const u8,
+        prop_name: []const u8,
+        namespace: ?[]const u8 = null,
+        prototype: bool,
+    }) !void {
+        const w = args.w;
+        if (!args.prototype) try w.writeAll("extern inline ");
+        try w.writeAll(args.return_type);
+        try w.writeAll(" ");
+        for (0..args.ptr_count) |_| {
+            try w.writeAll("*");
+        }
+        try w.writeAll(args.struct_name);
+        try w.writeAll("_get_");
+        if (args.namespace) |name| {
+            try w.writeAll(name);
             try w.writeAll("_");
-            try w.writeAll(f);
         }
-        try w.writeAll("_");
-        try w.writeAll(ident);
+        try w.writeAll(args.prop_name);
         try w.writeAll("(const struct ");
-        try w.writeAll(struct_name);
+        try w.writeAll(args.struct_name);
         try w.writeAll(" *self)");
-
-        if (generate_body) {
+        if (args.prototype) {
+            try w.writeAll(";\n");
+        } else {
             try w.writeAll(" { return self->");
-            for (field_names.slice()) |f| {
-                try w.writeAll(f);
+            if (args.namespace) |name| {
+                try w.writeAll(name);
                 try w.writeAll(".");
             }
-            try w.writeAll(ident);
-            try w.writeAll("; }");
-        } else {
+            try w.writeAll(args.prop_name);
+            try w.writeAll("; }\n");
+        }
+
+        if (!args.prototype) try w.writeAll("extern inline ");
+        try w.writeAll("void ");
+        try w.writeAll(args.struct_name);
+        try w.writeAll("_set_");
+        if (args.namespace) |name| {
+            try w.writeAll(name);
+            try w.writeAll("_");
+        }
+        try w.writeAll(args.prop_name);
+        try w.writeAll("(struct ");
+        try w.writeAll(args.struct_name);
+        try w.writeAll(" *self, ");
+        try w.writeAll(args.return_type);
+        try w.writeAll(" ");
+        for (0..args.ptr_count) |_| {
+            try w.writeAll("*");
+        }
+        try w.writeAll("val)");
+        if (args.prototype) {
             try w.writeAll(";");
+        } else {
+            try w.writeAll(" { self->");
+            if (args.namespace) |name| {
+                try w.writeAll(name);
+                try w.writeAll(".");
+            }
+            try w.writeAll(args.prop_name);
+            try w.writeAll(" = val; }");
         }
         try w.writeAll("\n\n");
     }
-}
+};
 
-pub fn generateAccessors(
-    comptime RT: type,
-    comptime WT: type,
-    allocator: std.mem.Allocator,
-    r: intf.io.Reader(RT),
-    w: intf.io.Writer(WT),
-    options: AccessorOptions,
-) !void {
-    var diagnostics: aro.Diagnostics = .{ .output = options.output };
-    var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
-    defer comp.deinit();
+const GenPrototype = struct {
+    source: []const u8,
+    options: Options = .{},
 
-    for (options.include_path) |path| {
-        try comp.addSystemIncludeDir(path);
-    }
+    const Self = @This();
 
-    var rr = RemoveIncludes.Wrap(RT).init(r);
-    const file = try comp.addSourceFromReader(rr.reader(), "file.c", .user);
-    const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
+    pub const Filter = struct {
+        context: *anyopaque = undefined,
+        predicate: *const fn (context: *anyopaque, item: FuncItem) bool,
+    };
 
-    var pp = aro.Preprocessor.init(&comp, .default);
-    defer pp.deinit();
-    try pp.addBuiltinMacros();
+    const Options = struct {
+        comments: bool = true,
+        retain_includes: bool = false,
+        prepend_str: []const u8 = &.{},
+        append_str: []const u8 = &.{},
+        filter: ?Filter = null,
+        debug_tree: bool = false,
+    };
 
-    _ = try pp.preprocess(builtin_macros);
+    fn functionProto(
+        self: Self,
+        w: std.io.AnyWriter,
+    ) !void {
+        const source = self.source;
+        const options = self.options;
+        const language = tree_sitter_c();
+        defer language.destroy();
 
-    const eof = try pp.preprocess(file);
-    try pp.addToken(eof);
+        std.debug.assert(language.abiVersion() == ts.LANGUAGE_VERSION);
+        const parser = ts.Parser.create();
+        defer parser.destroy();
+        try parser.setLanguage(language);
 
-    var tree = try aro.Parser.parse(&pp);
-    defer tree.deinit();
+        const tree = parser.parseString(source, null) orelse @panic("failed to parse");
+        defer tree.destroy();
 
-    try w.writeAll(options.prepend_str);
+        const root = tree.rootNode();
+        var iter_children = root.iterateChildren();
+        defer iter_children.destroy();
 
-    loop: for (tree.root_decls.items) |node| {
-        const decl = switch (node.get(&tree)) {
-            else => continue :loop,
-            .struct_decl => |e| e,
-        };
+        if (options.debug_tree) try root.writeJSON(stderr.writer().any(), .{ .source = source });
 
-        if (options.filter) |filter| {
-            const struct_name = tree.tokSlice(decl.name_or_kind_tok);
-            const include = filter.predicate(.{
-                .has_bitfields = has_bitfield(&tree, decl),
-                .name = struct_name,
-            }, filter.context);
-
-            if (!include) continue :loop;
+        if (options.prepend_str.len > 0) {
+            try w.writeAll(options.prepend_str);
+            try w.writeAll("\n");
         }
 
-        try generateStructAccessors(WT, &tree, node, w, options.generate_body);
-    }
+        var i: usize = 0;
+        var start_comment: ?usize = null;
+        while (iter_children.nextNamed()) |node| {
+            const kind: Kind = try .get(node);
 
-    try w.writeAll(options.append_str);
-}
-
-pub fn generateProto(
-    comptime RT: type,
-    comptime WT: type,
-    allocator: std.mem.Allocator,
-    r: intf.io.Reader(RT),
-    w: intf.io.Writer(WT),
-    options: ProtoOptions,
-) !void {
-    var diagnostics: aro.Diagnostics = .{ .output = options.output };
-    var comp = aro.Compilation.init(allocator, &diagnostics, std.fs.cwd());
-    defer comp.deinit();
-
-    // TODO: preserve function comments
-    // Currently preserve_comments only works for the preprocessing step:
-    // https://github.com/Vexu/arocc/issues/871
-    //comp.langopts.preserve_comments = true;
-
-    for (options.include_path) |path| {
-        try comp.addSystemIncludeDir(path);
-    }
-
-    var rr = RemoveIncludes.Wrap(RT).init(r);
-    const file = try comp.addSourceFromReader(rr.reader(), "file.c", .user);
-    const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
-    var pp = aro.Preprocessor.init(&comp, .default);
-
-    defer pp.deinit();
-    try pp.addBuiltinMacros();
-    _ = try pp.preprocess(builtin_macros);
-
-    const eof = try pp.preprocess(file);
-    try pp.addToken(eof);
-
-    var tree = try aro.Parser.parse(&pp);
-    defer tree.deinit();
-
-    const ids = tree.tokens.items(.id);
-
-    try w.writeAll(options.prepend_str);
-
-    loop: for (tree.root_decls.items) |node_index| {
-        const f = switch (node_index.get(&tree)) {
-            else => continue :loop,
-            .function => |f| f,
-        };
-
-        if (options.filter) |filter| {
-            const name = tree.tokSlice(f.name_tok);
-            const include = filter.predicate(.{
-                .name = name,
-                .@"inline" = f.@"inline",
-                .static = f.static,
-            }, filter.context);
-
-            if (!include) continue :loop;
-        }
-
-        // search and print comments at the top of a function
-        const fn_index = node_index.tok(&tree);
-        if (fn_index >= 2) {
-            // fn_index points to function name,
-            // fn_index-1 to the return token,
-            // so start looking at -2 offset
-            const end_index = fn_index - 1;
-            var idx: i32 = @intCast(end_index - 1); // cast to i32 to prevent overflow
-            while (idx >= 0) : (idx -= 1) {
-                switch (ids[@intCast(idx)]) {
-                    .comment, .unterminated_comment => {},
-                    else => break,
+            defer {
+                i += 1;
+                if (kind != .comment) {
+                    start_comment = null;
                 }
             }
 
-            const start_index: usize = @intCast(idx + 1);
-            for (start_index..end_index) |i| {
-                const content = tree.tokSlice(@intCast(i));
-                try w.writeAll(content);
-                try w.writeAll("\n");
+            switch (kind) {
+                .comment => {
+                    const range = node.startByte();
+                    if (range > 0 and range < source.len - 1 and source[range - 1] == '\n') {
+                        // only include comments that start on a new line
+                        start_comment = start_comment orelse i;
+                    }
+                },
+
+                .preproc_include => {
+                    if (options.retain_includes) {
+                        try dumpInclude(source, w, node);
+                        try w.writeAll("\n\n");
+                    }
+                },
+
+                .function_definition => {
+                    if (options.comments) {
+                        for ((start_comment orelse i)..i) |k| {
+                            const comment = root.namedChild(@intCast(k)) orelse continue;
+                            try w.writeAll(comment.raw(source));
+                            try w.writeAll("\n");
+                        }
+                    }
+
+                    const ok = try self.dumpFnPrototype(w, node);
+                    if (ok) try w.writeAll("\n\n");
+                },
+
+                else => {},
             }
         }
 
-        switch (f.qt.type(tree.comp)) {
-            else => {},
-            .func => |f_type| {
-                try f_type.return_type.print(tree.comp, w);
-                try w.writeAll(" ");
-                try w.writeAll(tree.tokSlice(f.name_tok));
-                try w.writeAll("(");
-                for (f_type.params, 0..) |p, idx| {
-                    if (idx > 0) try w.writeAll(", ");
-                    const name = tree.tokSlice(p.name_tok);
-                    try p.qt.printNamed(name, tree.comp, w);
+        if (options.append_str.len > 0) {
+            try w.writeAll("\n");
+            try w.writeAll(options.append_str);
+        }
+    }
+
+    fn dumpFnPrototype(
+        self: Self,
+        w: std.io.AnyWriter,
+        fn_def: ts.Node,
+    ) !bool {
+        const source = self.source;
+        const options = self.options;
+
+        std.debug.assert(try Kind.get(fn_def) == .function_definition);
+        std.debug.assert(fn_def.childCount() >= 2);
+
+        var start_index: u32 = 0;
+        var flags = FuncFlags{};
+        while (fn_def.child(start_index)) |n| {
+            if (try Kind.get(n) != .storage_class_specifier) break;
+            const tag = std.meta.stringToEnum(StorateClassSpec, n.raw(source));
+            switch (tag orelse StorateClassSpec.unknown) {
+                .@"extern" => flags.is_extern = true,
+                .static => flags.is_static = true,
+                .@"inline" => flags.is_inline = true,
+                .unknown => {},
+            }
+            start_index += 1;
+        }
+
+        const decl, var ptr_count = try unwrapPointerDeclarators(fn_def.child(start_index + 1).?);
+        const kind: Kind = try .get(decl);
+        std.debug.assert(kind == .function_declarator or kind == .parenthesized_declarator);
+        std.debug.assert(decl.childCount() >= 2);
+
+        // the node structure is different for functions like: int int funcname(void) { }
+        // where the parameter is just void identifier.
+        const is_void_arg = kind == .parenthesized_declarator;
+
+        const fn_name = switch (is_void_arg) {
+            true => fn_def.child(start_index).?.raw(source),
+            false => decl.child(0).?.raw(source),
+        };
+
+        if (options.filter) |filter| {
+            const item: FuncItem = .{
+                .name = fn_name,
+                .flags = flags,
+            };
+            if (!filter.predicate(filter.context, item)) return false;
+        }
+
+        if (is_void_arg) {
+            const paren_decl = decl;
+            const identifier = paren_decl.child(1).?.raw(source);
+            try w.writeAll(fn_name);
+            try w.writeAll("(");
+            try w.writeAll(identifier);
+            try w.writeAll(");");
+            return true;
+        }
+
+        const fn_decl = decl;
+        const ret_type = fn_def.child(start_index).?.raw(source);
+
+        try w.writeAll(ret_type);
+        if (ret_type.len > 0) try w.writeAll(" ");
+
+        for (0..ptr_count) |_| {
+            try w.writeAll("*");
+        }
+        try w.writeAll(fn_name);
+
+        try w.writeAll("(");
+        {
+            const parameters = fn_decl.child(1).?;
+            std.debug.assert(try Kind.get(parameters) == .parameter_list);
+
+            var param_iter = parameters.iterateChildren();
+            defer param_iter.destroy();
+
+            var i: usize = 0;
+            const num_params = parameters.namedChildCount();
+            while (param_iter.nextNamed()) |param| {
+                std.debug.assert(param.childCount() >= 1);
+
+                const ptype = param.child(0).?.raw(source);
+                try w.writeAll(ptype);
+
+                if (param.child(1)) |pointer_decls| {
+                    try w.writeAll(" ");
+                    const identifier, ptr_count = try unwrapPointerDeclarators(pointer_decls);
+                    for (0..ptr_count) |_| {
+                        try w.writeAll("*");
+                    }
+                    try w.writeAll(identifier.raw(source));
                 }
-                try w.writeAll(");\n\n");
-            },
+
+                if (i < num_params - 1) {
+                    try w.writeAll(", ");
+                }
+                i += 1;
+            }
         }
+        try w.writeAll(");");
+
+        return true;
     }
+};
 
-    try w.writeAll(options.append_str);
-}
-
-// Caller should free returned string
-pub fn generateAccessorsString(allocator: std.mem.Allocator, code: String, options: AccessorOptions) !String {
-    var w = std.ArrayList(u8).init(allocator);
-    var r = std.io.fixedBufferStream(code);
-
-    defer w.deinit();
-
-    try generateAccessors(@TypeOf(r), @TypeOf(w), allocator, r.reader(), w.writer(), options);
-    return try w.toOwnedSlice();
-}
-
-// Caller should free returned string
-pub fn generateProtoString(allocator: std.mem.Allocator, code: String, options: ProtoOptions) !String {
-    const len: f32 = @floatFromInt(code.len);
-    var buffer = try allocator.alloc(u8, @intFromFloat(@ceil(len / 1024) * 1024 * 10));
-    defer allocator.free(buffer);
-
-    var w = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(buffer[0..]) };
-    var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
-    try generateProto(@TypeOf(r), @TypeOf(w), allocator, r.reader(), w.writer(), options);
-
-    return allocator.dupe(u8, w.buffer.getWritten());
-}
-
-fn has_bitfield(tree: *aro.Tree, decl: Node.ContainerDecl) bool {
-    for (decl.fields) |field| {
-        switch (field.get(tree)) {
-            .record_field => |r| {
-                if (r.bit_width != null) return true;
-            },
-            else => {},
-        }
+// tree-sitter-c wraps the identifier with one or more pointer declarations,
+// so this function returns the identifier and number of * before it
+fn unwrapPointerDeclarators(node: ts.Node) !struct { ts.Node, usize } {
+    var count: usize = 0;
+    var current = node;
+    while (try Kind.get(current) == .pointer_declarator) {
+        current = current.child(1) orelse @panic("pointer_declarater must have two subnodes");
+        count += 1;
     }
-    return false;
+    return .{ current, count };
 }
 
-test "generate getters" {
+fn dumpInclude(
+    source: []const u8,
+    w: std.io.AnyWriter,
+    include_node: ts.Node,
+) !void {
+    const path = include_node.child(1) orelse return;
+
+    try w.writeAll("#include ");
+    switch (try Kind.get(path)) {
+        else => {},
+        .string_literal => {
+            if (path.child(1)) |str| {
+                try w.writeByte('"');
+                try w.writeAll(str.raw(source));
+                try w.writeByte('"');
+            }
+        },
+        .system_lib_string => {
+            try w.writeAll(path.raw(source));
+        },
+    }
+}
+
+pub fn prototype(
+    source: String,
+    w: std.io.AnyWriter,
+    options: GenPrototype.Options,
+) !void {
+    const gen = GenPrototype{ .source = source, .options = options };
+    try gen.functionProto(w);
+}
+
+// Caller must free returned string
+pub fn prototypeString(
+    allocator: std.mem.Allocator,
+    source: String,
+    options: GenPrototype.Options,
+) ![]const u8 {
+    const gen = GenPrototype{ .source = source, .options = options };
+    var buf = std.ArrayList(u8).init(allocator);
+    try gen.functionProto(buf.writer().any());
+    return buf.toOwnedSlice();
+}
+
+pub fn accessors(
+    source: String,
+    w: std.io.AnyWriter,
+    options: GenAccessors.Options,
+) !void {
+    const gen = GenAccessors{ .source = source, .options = options };
+    try gen.accessors(w, options);
+}
+
+pub fn accessorsString(
+    allocator: std.mem.Allocator,
+    source: String,
+    options: GenAccessors.Options,
+) ![]const u8 {
+    const gen = GenAccessors{ .source = source, .options = options };
+    var buf = std.ArrayList(u8).init(allocator);
+    try gen.accessors(buf.writer().any(), options);
+    return buf.toOwnedSlice();
+}
+
+test "generate function prototype" {
+    const source =
+        \\ #include "def.h"
+        \\
+        \\ int x = 10; // will not be included
+        \\ int z = 10; // will not be included
+        \\struct Bar** foo(int x, char * y) { return 0; }
+        \\
+        \\int y = 123; // will not be included
+        \\
+        \\//this is bar
+        \\//bar does something
+        \\void bar() {}
+        \\
+        \\baz(void) {}
+        \\
+        \\/* This is function f,
+        \\    it does nothing */
+        \\void f() {}
+        \\
+        \\void g(void); // will not be included
+        \\int *h(void); // will not be included
+        \\
+        \\void k(void) { }
+        \\
+    ;
+    const expected =
+        \\#include "def.h"
+        \\
+        \\struct Bar **foo(int x, char *y);
+        \\
+        \\//this is bar
+        \\//bar does something
+        \\void bar();
+        \\
+        \\baz(void);
+        \\
+        \\/* This is function f,
+        \\    it does nothing */
+        \\void f();
+        \\
+        \\void k(void);
+        \\
+        \\
+    ;
+
+    const expected_bare =
+        \\struct Bar **foo(int x, char *y);
+        \\
+        \\void bar();
+        \\
+        \\baz(void);
+        \\
+        \\void f();
+        \\
+        \\void k(void);
+        \\
+        \\
+    ;
+
+    const allocator = std.testing.allocator;
+    const output = try prototypeString(allocator, source, .{
+        .comments = true,
+        .retain_includes = true,
+    });
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(expected, output);
+
+    const output_bare = try prototypeString(allocator, source, .{
+        .comments = false,
+        .retain_includes = false,
+    });
+    defer std.testing.allocator.free(output_bare);
+
+    try std.testing.expectEqualStrings(expected_bare, output_bare);
+}
+
+test "generate function prototype with filter" {
+    const source =
+        \\ extern inline static void foo() { }
+        \\ void bar() { }
+        \\
+        \\ void baz() { }
+    ;
+    const expected =
+        \\void foo();
+        \\
+        \\void bar();
+        \\
+        \\
+    ;
+
+    const allocator = std.testing.allocator;
+    const output = try prototypeString(allocator, source, .{
+        .comments = true,
+        .retain_includes = true,
+        .filter = .{
+            .predicate = struct {
+                fn _(_: *anyopaque, item: FuncItem) bool {
+                    return item.flags.is_extern or std.mem.eql(u8, item.name, "bar");
+                }
+            }._,
+        },
+    });
+    defer allocator.free(output);
+
+    try std.testing.expectEqualStrings(expected, output);
+}
+
+test "generate accessors" {
     const code: []const u8 =
         \\int x;
         \\struct Foo {
@@ -445,19 +754,21 @@ test "generate getters" {
     ;
     const expected =
         \\extern inline int Foo_get_a(const struct Foo *self) { return self->a; }
+        \\extern inline void Foo_set_a(struct Foo *self, int val) { self->a = val; }
         \\
         \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
+        \\extern inline void Foo_set_b(struct Foo *self, char *val) { self->b = val; }
     ;
 
-    const output = try generateAccessorsString(std.testing.allocator, code, .{});
+    const output = try accessorsString(std.testing.allocator, code, .{});
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
         std.mem.trim(u8, expected, "\n "),
+        std.mem.trim(u8, output, "\n "),
     );
 }
 
-test "generate getter prototype" {
+test "generate accessor prototype" {
     const code: []const u8 =
         \\int x;
         \\struct Foo {
@@ -467,319 +778,52 @@ test "generate getter prototype" {
     ;
     const expected =
         \\int Foo_get_a(const struct Foo *self);
+        \\void Foo_set_a(struct Foo *self, int val);
         \\
         \\char *Foo_get_b(const struct Foo *self);
+        \\void Foo_set_b(struct Foo *self, char *val);
     ;
 
-    const output = try generateAccessorsString(std.testing.allocator, code, .{ .generate_body = false });
-    defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "struct fields" {
-    const code: []const u8 =
-        \\struct Foo {
-        \\  int x;
-        \\  struct {
-        \\    int a;
-        \\    char *b;
-        \\  } data;
-        \\};
-    ;
-    const expected =
-        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
-        \\
-        \\extern inline int Foo_get_data_a(const struct Foo *self) { return self->data.a; }
-        \\
-        \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{});
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "anonymous structs" {
-    const code: []const u8 =
-        \\struct Foo {
-        \\  int x;
-        \\  struct {
-        \\    int a;
-        \\    char *b;
-        \\  };
-        \\};
-    ;
-    const expected =
-        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
-        \\
-        \\extern inline int Foo_get_a(const struct Foo *self) { return self->a; }
-        \\
-        \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{});
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "unions" {
-    const code: []const u8 =
-        \\struct Foo {
-        \\  int x;
-        \\
-        \\  union {
-        \\    int a;
-        \\    char *b;
-        \\  } data;
-        \\};
-    ;
-    const expected =
-        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
-        \\
-        \\extern inline int Foo_get_data_a(const struct Foo *self) { return self->data.a; }
-        \\
-        \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{});
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "anonymous unions" {
-    const code: []const u8 =
-        \\struct Foo {
-        \\  int x;
-        \\
-        \\  union {
-        \\    int a;
-        \\    char *b;
-        \\  };
-        \\};
-    ;
-    const expected =
-        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
-        \\
-        \\extern inline int Foo_get_a(const struct Foo *self) { return self->a; }
-        \\
-        \\extern inline char *Foo_get_b(const struct Foo *self) { return self->b; }
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{});
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "skip pointers to anonymous structs" {
-    const code: []const u8 =
-        \\struct Foo {
-        \\  int x;
-        \\  int y;
-        \\
-        \\  struct {
-        \\    int a;
-        \\    char *b;
-        \\  } *g;
-        \\};
-    ;
-    const expected =
-        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
-        \\
-        \\extern inline int Foo_get_y(const struct Foo *self) { return self->y; }
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{});
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "skip pointers to anonymous unions" {
-    const code: []const u8 =
-        \\struct Foo {
-        \\  int x;
-        \\  int y;
-        \\
-        \\  union {
-        \\    int a;
-        \\    char *b;
-        \\  } *g;
-        \\};
-    ;
-    const expected =
-        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
-        \\
-        \\extern inline int Foo_get_y(const struct Foo *self) { return self->y; }
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{});
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "filter by struct name" {
-    const code: []const u8 =
-        \\struct AAA { int x; };
-        \\struct BBB { int x; };
-        \\struct CCC { int x; };
-    ;
-    const expected =
-        \\int AAA_get_x(const struct AAA *self);
-    ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{
-        .generate_body = false,
-        .filter = .{
-            .predicate = struct {
-                fn apply(item: StructItem, _: *anyopaque) bool {
-                    return std.mem.eql(u8, item.name, "AAA");
-                }
-            }.apply,
-        },
+    const output = try accessorsString(std.testing.allocator, code, .{
+        .func_prototype = true,
     });
-
     defer std.testing.allocator.free(output);
+
     try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
         std.mem.trim(u8, expected, "\n "),
+        std.mem.trim(u8, output, "\n "),
     );
 }
 
-test "filter by struct with bitfields" {
-    const code: []const u8 =
-        \\struct AAA { int x: 3; int y;  };
-        \\struct BBB { int x; };
-        \\struct CCC { int x: 2; };
-        \\struct DDD { char a; char b; };
+test "generate accessors, filter bitfielded structs" {
+    const source =
+        \\#include <stdio.h>
+        \\typedef struct AAA {int x: 100;} BBB;
+        \\struct AAA {
+        \\   int x; char y;
+        \\   struct X *x;
+        \\   union {struct V *rr; /*comment*/ int yy; struct {} zz;} xyz;
+        \\  // comment
+        \\};
+        \\struct BBB {
+        \\   int x;
+        \\   int z: 100;
+        \\};
     ;
     const expected =
-        \\int AAA_get_x(const struct AAA *self);
+        \\extern inline int BBB_get_x(const struct BBB *self) { return self->x; }
+        \\extern inline void BBB_set_x(struct BBB *self, int val) { self->x = val; }
         \\
-        \\int AAA_get_y(const struct AAA *self);
+        \\extern inline int BBB_get_z(const struct BBB *self) { return self->z; }
+        \\extern inline void BBB_set_z(struct BBB *self, int val) { self->z = val; }
         \\
-        \\int CCC_get_x(const struct CCC *self);
+        \\
     ;
-
-    const output = try generateAccessorsString(std.testing.allocator, code, .{
-        .generate_body = false,
+    const output = try accessorsString(std.testing.allocator, source, .{
         .filter = .{
             .predicate = struct {
-                fn apply(item: StructItem, _: *anyopaque) bool {
-                    return item.has_bitfields;
-                }
-            }.apply,
-        },
-    });
-
-    defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, expected, "\n "),
-        std.mem.trim(u8, output, "\n "),
-    );
-}
-
-test "generateProto" {
-    const code: []const u8 =
-        \\int foo(int x, int y) { return x+y; }
-        \\void bar(char z) { }
-        \\void baz() { }
-    ;
-    const expected =
-        \\int foo(int x, int y);
-        \\
-        \\void bar(char z);
-        \\
-        \\void baz();
-    ;
-
-    const output = try generateProtoString(std.testing.allocator, code, .{});
-    defer std.testing.allocator.free(output);
-
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-// TODO:
-//test "generateProto with comments" {
-//    const code: []const u8 =
-//        \\// this is foo function
-//        \\// it adds two number
-//        \\int foo(int x, int y) { return x+y; }
-//        \\/** bar does something
-//        \\    but returns nothing
-//        \\*/
-//        \\void bar(char z) { }
-//        \\void baz() { }
-//        \\/*end of file*/
-//    ;
-//    const expected =
-//        \\// this is foo function
-//        \\// it adds two number
-//        \\int foo(int x, int y);
-//        \\
-//        \\/** bar does something
-//        \\    but returns nothing
-//        \\*/
-//        \\void bar(char z);
-//        \\
-//        \\void baz();
-//    ;
-//
-//    const output = try generateProtoString(std.testing.allocator, code, .{});
-//    defer std.testing.allocator.free(output);
-//
-//    try std.testing.expectEqualStrings(
-//        std.mem.trim(u8, output, "\n "),
-//        std.mem.trim(u8, expected, "\n "),
-//    );
-//}
-
-test "generateProto with filter" {
-    const code: []const u8 =
-        \\int f1(int x, int y) { return x+y; }
-        \\int f2(int x, int y) { return x+y; }
-        \\int f3(int x, int y) { return x+y; }
-        \\int f4(int x, int y) { return x+y; }
-    ;
-    const expected =
-        \\int f1(int x, int y);
-        \\
-        \\int f3(int x, int y);
-    ;
-
-    const output = try generateProtoString(std.testing.allocator, code, .{
-        .filter = .{
-            .predicate = struct {
-                fn _(item: FuncItem, _: *anyopaque) bool {
-                    return std.mem.eql(u8, item.name, "f1") or std.mem.eql(u8, item.name, "f3");
+                fn _(_: *anyopaque, item: StructItem) bool {
+                    return item.hasBitFields();
                 }
             }._,
         },
@@ -787,221 +831,84 @@ test "generateProto with filter" {
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
         std.mem.trim(u8, expected, "\n "),
+        std.mem.trim(u8, output, "\n "),
     );
 }
 
-/// A set of functions that replaces #includes<...>
-/// with an empty line from a string or reader.
-/// This is because of I'm getting weird
-/// errors related to headers not being found by aroccc,
-/// despite setting up my path correctly and zig
-/// finds the headers just fine. Probably a bug,
-/// or I misconfigured something. In any case,
-/// system headers aren't really needed since
-/// only the file itself needs to be parsed.
-/// So as a workaround, just filter those lines out.
-const RemoveIncludes = struct {
-    pub fn Wrap(comptime T: type) type {
-        return struct {
-            const Self = @This();
-
-            r: intf.io.Reader(T),
-            line_buf: [4096]u8 = undefined,
-            leftover: ?[]u8 = null,
-
-            pub fn read(self: *Self, buf: []u8) anyerror!usize {
-                if (self.leftover) |line| {
-                    if (line.len >= buf.len) { // -1 for the newline
-                        @memcpy(buf, line[0..buf.len]);
-                        self.leftover = line[buf.len..];
-                        return buf.len;
-                    } else {
-                        @memcpy(buf[0..line.len], line);
-                        buf[line.len] = '\n';
-                        self.leftover = null;
-                        return line.len + 1; // +1 for the newline
-                    }
-                }
-
-                while (true) {
-                    // TODO: fix added extra line at EOF
-                    const line = try self.r.readUntilDelimiterOrEof(&self.line_buf, '\n') orelse {
-                        break;
-                    };
-
-                    if (isInclude(line)) {
-                        buf[0] = '\n';
-                        return 1;
-                    } else if (line.len >= buf.len) {
-                        @memcpy(buf, line[0..buf.len]);
-                        self.leftover = line[buf.len..];
-                        return buf.len;
-                    } else {
-                        @memcpy(buf[0..line.len], line);
-                        buf[line.len] = '\n';
-                        return line.len + 1; // +1 for the newline
-                    }
-                }
-                return 0;
-            }
-
-            pub fn reader(self: *Self) intf.io.Reader(Self) {
-                return .{
-                    .context = self,
-                };
-            }
-
-            pub fn init(r: intf.io.Reader(T)) Self {
-                return .{ .r = r };
-            }
-        };
-    }
-
-    pub fn pipe(
-        comptime RT: type,
-        comptime WT: type,
-        r: intf.io.Reader(RT),
-        w: intf.io.Writer(WT),
-    ) !void {
-        var buf: [4096]u8 = undefined;
-
-        while (true) {
-            if (try r.readUntilDelimiterOrEof(&buf, '\n')) |line| {
-                if (!isInclude(line)) {
-                    _ = try w.writeAll(line);
-                    _ = try w.writeByte('\n');
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    // Caller should free returned string
-    pub fn byString(allocator: std.mem.Allocator, c_code: []const u8) ![]const u8 {
-        var buf = std.ArrayList(u8).init(allocator);
-        var iter = std.mem.tokenizeScalar(u8, c_code, '\n');
-        while (iter.next()) |line| {
-            if (isInclude(line)) continue;
-            try buf.appendSlice(line);
-            try buf.append('\n');
-        }
-        return try buf.toOwnedSlice();
-    }
-
-    fn isInclude(s: []const u8) bool {
-        return std.mem.startsWith(u8, s, "#include");
-    }
-};
-
-test "prepend and append string" {
-    const code: []const u8 =
-        \\int foo(int x) { return x+1; }
+test "generate accessors with anonymous structs" {
+    const source: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\  struct {
+        \\    int a;
+        \\    char *b;
+        \\  } data;
+        \\
+        \\
+        \\  union {
+        \\    int c;
+        \\  } data2;
+        \\
+        \\  struct {  } data2; // no fields
+        \\
+        \\  struct{}; // ignored
+        \\  union{}; // ignored
+        \\};
     ;
-
     const expected =
-        \\//generated, do not edit!
+        \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
+        \\extern inline void Foo_set_x(struct Foo *self, int val) { self->x = val; }
         \\
-        \\int foo(int x);
+        \\extern inline int Foo_get_data_a(const struct Foo *self) { return self->data.a; }
+        \\extern inline void Foo_set_data_a(struct Foo *self, int val) { self->data.a = val; }
         \\
-        \\//EOF
+        \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
+        \\extern inline void Foo_set_data_b(struct Foo *self, char *val) { self->data.b = val; }
+        \\
+        \\extern inline int Foo_get_data2_c(const struct Foo *self) { return self->data2.c; }
+        \\extern inline void Foo_set_data2_c(struct Foo *self, int val) { self->data2.c = val; }
+        \\
     ;
 
-    const output = try generateProtoString(std.testing.allocator, code, .{
-        .include_path = &[_][]const u8{"test"},
-        .prepend_str = "//generated, do not edit!\n\n",
-        .append_str = "//EOF\n",
+    const output = try accessorsString(std.testing.allocator, source, .{});
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, expected, "\n "),
+        std.mem.trim(u8, output, "\n "),
+    );
+}
+
+test "skip pointers to anonymous structs" {
+    const source: []const u8 =
+        \\struct Foo {
+        \\  int x;
+        \\  int y;
+        \\
+        \\  // ignore pointers to anonymous struct
+        \\  struct {
+        \\    int a;
+        \\    char *b;
+        \\  } *g;
+        \\};
+    ;
+    const expected =
+        \\int Foo_get_x(const struct Foo *self);
+        \\void Foo_set_x(struct Foo *self, int val);
+        \\
+        \\int Foo_get_y(const struct Foo *self);
+        \\void Foo_set_y(struct Foo *self, int val);
+        \\
+    ;
+
+    const output = try accessorsString(std.testing.allocator, source, .{
+        .func_prototype = true,
     });
-
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(
-        std.mem.trim(u8, output, "\n "),
         std.mem.trim(u8, expected, "\n "),
-    );
-}
-
-test "remove includes by string" {
-    const code =
-        \\#include <stdio.h>
-        \\#define X 100
-        \\void foo() { }
-        \\#include <bfd.h>
-        \\void bar() { }
-        \\// this one is fine
-    ;
-    const expected =
-        \\#define X 100
-        \\void foo() { }
-        \\void bar() { }
-        \\// this one is fine
-    ;
-
-    const output = try RemoveIncludes.byString(std.testing.allocator, code);
-    defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings(
         std.mem.trim(u8, output, "\n "),
-        std.mem.trim(u8, expected, "\n "),
     );
-}
-
-test "remove includes by wrapping" {
-    const code =
-        \\#include <stdio.h>
-        \\#define X 100
-        \\void foo() { }
-        \\#include <bfd.h>
-        \\void bar() { }
-        \\// some comment
-    ;
-
-    var r = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(code) };
-
-    const expected =
-        \\
-        \\#define X 100
-        \\void foo() { }
-        \\
-        \\void bar() { }
-        \\// some comment
-    ;
-
-    var rr = RemoveIncludes.Wrap(@TypeOf(r)).init(r.reader());
-    const str = try rr.reader().readAllAlloc(std.testing.allocator, std.math.maxInt(u8));
-    defer std.testing.allocator.free(str);
-    const output = std.mem.trimEnd(u8, str, "\n ");
-
-    try std.testing.expectEqualStrings(expected, output);
-}
-
-test "remove includes by wrapping with tiny and large buffer" {
-    const input = "abcdefghijklmno\npqrstuvwxyz";
-    var r = std.io.fixedBufferStream(input);
-    var temp = RemoveIncludes.Wrap(@TypeOf(r)).init(r.reader());
-    var reader = temp.reader();
-
-    var buf: [5]u8 = undefined;
-    var n = try reader.read(&buf);
-    try std.testing.expectEqualStrings("abcde", buf[0..n]);
-    n = try reader.read(&buf);
-    try std.testing.expectEqualStrings("fghij", buf[0..n]);
-    n = try reader.read(&buf);
-    try std.testing.expectEqualStrings("klmno", buf[0..n]);
-    n = try reader.read(&buf);
-    try std.testing.expectEqualStrings("\n", buf[0..n]);
-    n = try reader.read(&buf);
-    try std.testing.expectEqualStrings("pqrst", buf[0..n]);
-    n = try reader.read(&buf);
-    try std.testing.expectEqualStrings("uvwxy", buf[0..n]);
-    n = try reader.read(&buf);
-    try std.testing.expectEqualStrings("z\n", buf[0..n]);
-
-    var buf_large: [100]u8 = undefined;
-    try r.seekTo(0);
-    n = try reader.read(&buf_large);
-    try std.testing.expectEqualStrings("abcdefghijklmno\n", buf_large[0..n]);
-    n = try reader.read(&buf_large);
-    try std.testing.expectEqualStrings("pqrstuvwxyz\n", buf_large[0..n]);
 }

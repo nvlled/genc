@@ -4,7 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const aro = b.dependency("aro", .{
+    const tree_sitter = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const tree_sitter_c = b.dependency("tree_sitter_c", .{
         .target = target,
         .optimize = optimize,
     });
@@ -19,12 +24,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{
-                .name = "aro",
-                .module = aro.module("aro"),
-            },
-            .{
                 .name = "intf",
                 .module = intf.module("intf"),
+            },
+            .{
+                .name = "tree-sitter",
+                .module = tree_sitter.module("tree-sitter"),
+            },
+            .{
+                .name = "tree-sitter-c",
+                .module = tree_sitter_c.module("tree-sitter-c"),
             },
         },
     });
