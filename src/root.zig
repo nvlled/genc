@@ -82,7 +82,7 @@ pub const StructItem = struct {
     // since this is somewhat an expensive search
     // use a function instead of a flag to lazily search
     // only when required.
-    fn hasBitFields(self: Self) bool {
+    pub fn hasBitFields(self: Self) bool {
         const struct_body: *const ts.Node = @alignCast(@ptrCast(self._context));
 
         var field_iter = struct_body.iterateChildren();
@@ -99,6 +99,16 @@ pub const StructItem = struct {
 
         return false;
     }
+};
+
+pub const FuncFilter = struct {
+    context: *anyopaque = undefined,
+    predicate: *const fn (context: *anyopaque, item: FuncItem) bool,
+};
+
+pub const StructFilter = struct {
+    context: *anyopaque = undefined,
+    predicate: *const fn (context: *anyopaque, item: StructItem) bool,
 };
 
 // To make more sense of the dump functions, you need to understand
@@ -124,13 +134,8 @@ const GenAccessors = struct {
         func_prototype: bool = false,
         prepend_str: []const u8 = &.{},
         append_str: []const u8 = &.{},
-        filter: ?Filter = null,
+        filter: ?StructFilter = null,
         debug_tree: bool = false,
-    };
-
-    const Filter = struct {
-        context: *anyopaque = undefined,
-        predicate: *const fn (context: *anyopaque, item: StructItem) bool,
     };
 
     fn accessors(
@@ -379,17 +384,12 @@ const GenPrototype = struct {
 
     const Self = @This();
 
-    const Filter = struct {
-        context: *anyopaque = undefined,
-        predicate: *const fn (context: *anyopaque, item: FuncItem) bool,
-    };
-
     const Options = struct {
         comments: bool = true,
         retain_includes: bool = false,
         prepend_str: []const u8 = &.{},
         append_str: []const u8 = &.{},
-        filter: ?Filter = null,
+        filter: ?FuncFilter = null,
         debug_tree: bool = false,
     };
 

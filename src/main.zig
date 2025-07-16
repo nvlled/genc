@@ -3,18 +3,18 @@ const stdout = std.io.getStdOut().writer();
 const genc = @import("genc");
 
 const Commands = enum {
-    accessors,
+    accessor,
     proto,
 };
 
 const CommonOptionNames = enum {
     @"name-contains",
     help,
+    header,
 };
 
 const AccessorOptionNames = enum {
     @"bitfields-only",
-    header,
     output,
 };
 
@@ -45,8 +45,6 @@ fn usage(argv: [][:0]u8) !void {
     try stdout.print("accessor command options:\n", .{});
     try stdout.print("  --{s}\n", .{@tagName(AccessorOptionNames.@"bitfields-only")});
     try stdout.print("      include all structs with bitfields only\n", .{});
-    try stdout.print("  --{s}\n", .{@tagName(AccessorOptionNames.header)});
-    try stdout.print("      generate a header file\n", .{});
     try stdout.print("\n", .{});
     try stdout.print("proto command options:\n", .{});
     try stdout.print("  --{s}\n", .{@tagName(ProtoOptionNames.@"inline-only")});
@@ -57,6 +55,8 @@ fn usage(argv: [][:0]u8) !void {
     try stdout.print("common options:\n", .{});
     try stdout.print("  --help\n", .{});
     try stdout.print("      show usage help\n", .{});
+    try stdout.print("  --{s}\n", .{@tagName(CommonOptionNames.header)});
+    try stdout.print("      generate a header file\n", .{});
     try stdout.print("  --{s}\t<name>\n", .{@tagName(CommonOptionNames.@"name-contains")});
     try stdout.print("      show only structs or functions with matching name\n", .{});
     try stdout.print("  --{s}\t<filename>\n", .{@tagName(AccessorOptionNames.output)});
@@ -99,7 +99,7 @@ pub fn _main() !void {
         }
         try stdout.print("unknown command: {s}\n", .{argv[1]});
         try usage(argv);
-        break :blk Commands.accessors;
+        break :blk Commands.accessor;
     };
 
     var arg_i: usize = 2;
@@ -118,9 +118,8 @@ pub fn _main() !void {
                         arg_i += 1;
                         continue;
                     },
-                    .help => {
-                        try usage(argv);
-                    },
+                    .header => options.generate_header = true,
+                    .help => try usage(argv),
                 }
             }
 
@@ -140,7 +139,7 @@ pub fn _main() !void {
                         try usage(argv);
                     }
                 },
-                .accessors => {
+                .accessor => {
                     if (std.meta.stringToEnum(AccessorOptionNames, option_name)) |value| {
                         switch (value) {
                             .output => {
@@ -150,9 +149,6 @@ pub fn _main() !void {
                             },
                             .@"bitfields-only" => {
                                 options.bitfields_only = true;
-                            },
-                            .header => {
-                                options.generate_header = true;
                             },
                         }
                     } else {
@@ -223,27 +219,31 @@ pub fn _main() !void {
     defer input_file.close();
     defer if (!to_stdout) output_file.close();
 
+    const source = try input_file.reader().readAllAlloc(allocator, 1024 * 1024 * 1024);
+    defer allocator.free(source);
+
     switch (command) {
-        .accessors => {
+        .accessor => {
             const filter =
                 if (options.name_filters.size == 0 and !options.bitfields_only)
                     null
                 else
                     genc.StructFilter{
                         .context = &options,
-                        .predicate = &struct {
-                            fn apply(item: genc.StructItem, context: *anyopaque) bool {
+                        .predicate = struct {
+                            fn _(context: *anyopaque, item: genc.StructItem) bool {
                                 const opt: *Options = @ptrCast(@alignCast(context));
                                 const names = opt.name_filters;
-                                if (opt.bitfields_only and !item.has_bitfields) return false;
+                                if (opt.bitfields_only and !item.hasBitFields()) return false;
                                 return names.size == 0 or names.contains(item.name);
                             }
-                        }.apply,
+                        }._,
                     };
 
-            try genc.generateAccessors(allocator, input_file.reader(), output_file.writer(), .{
+            try genc.generateAccessors(source, output_file.writer().any(), .{
                 .filter = filter,
-                .generate_body = true,
+                .func_prototype = false,
+                .debug_tree = true,
             });
 
             if (options.generate_header) {
@@ -258,9 +258,10 @@ pub fn _main() !void {
 
                 defer header_file.close();
                 try input_file.seekTo(0);
-                try genc.generateAccessors(allocator, input_file.reader(), header_file.writer(), .{
+                try genc.generateAccessors(source, header_file.writer().any(), .{
                     .filter = filter,
-                    .generate_body = false,
+                    .func_prototype = true,
+                    .debug_tree = true,
                 });
             }
         },
@@ -274,18 +275,19 @@ pub fn _main() !void {
                     genc.FuncFilter{
                         .context = &options,
                         .predicate = &struct {
-                            fn apply(item: genc.FuncItem, context: *anyopaque) bool {
+                            fn _(context: *anyopaque, item: genc.FuncItem) bool {
                                 const opt: *Options = @ptrCast(@alignCast(context));
                                 const names = opt.name_filters;
-                                if (opt.inline_only and !item.@"inline") return false;
-                                if (opt.static_only and !item.static) return false;
-                                return names.size == 0 or names.contains(item.name);
+                                if (opt.inline_only and !item.flags.is_inline) return false;
+                                if (opt.static_only and !item.flags.is_static) return false;
+                                return true or names.size == 0 or names.contains(item.name);
                             }
-                        }.apply,
+                        }._,
                     };
 
-            try genc.generateProto(allocator, input_file.reader(), output_file.writer(), .{
+            try genc.generatePrototype(source, output_file.writer().any(), .{
                 .filter = filter,
+                .debug_tree = true,
             });
         },
     }
