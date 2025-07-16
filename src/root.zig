@@ -16,6 +16,8 @@ const Kind = enum(u16) {
     system_lib_string = 155,
     comment = 160,
     preproc_include = 164,
+    preproc_def = 165,
+    preproc_ifdef = 170,
     function_definition = 196,
     declaration = 198,
     type_definition = 199,
@@ -113,6 +115,7 @@ pub const StructItem = struct {
 const GenAccessors = struct {
     source: []const u8,
     options: Options = .{},
+    w: std.io.AnyWriter,
 
     const Self = @This();
 
@@ -132,7 +135,6 @@ const GenAccessors = struct {
 
     fn accessors(
         self: Self,
-        w: std.io.AnyWriter,
         options: Options,
     ) !void {
         const source = self.source;
@@ -148,16 +150,23 @@ const GenAccessors = struct {
         defer tree.destroy();
 
         const root = tree.rootNode();
+
+        if (options.debug_tree) {
+            try root.writeJSON(stderr.writer().any(), .{ .source = source });
+        }
+
+        try self.dump(root, options);
+    }
+
+    fn dump(self: Self, root: ts.Node, options: Options) !void {
+        const source = self.source;
+        const w = self.w;
+
         var iter_children = root.iterateChildren();
         defer iter_children.destroy();
 
-        if (options.debug_tree) try root.writeJSON(stderr.writer().any(), .{ .source = source });
-
-        var i: usize = 0;
         while (iter_children.nextNamed()) |node| {
-            defer i += 1;
             const kind: Kind = try .get(node);
-
             switch (kind) {
                 .preproc_include => {
                     if (options.retain_includes) {
@@ -166,9 +175,20 @@ const GenAccessors = struct {
                     }
                 },
 
+                .type_definition, .declaration => {
+                    if (node.namedChild(0)) |child| {
+                        if (try Kind.get(child) == .struct_specifier) {
+                            try self.dumpStructAccessors(child);
+                        }
+                    }
+                },
+
+                .preproc_ifdef => {
+                    try self.dump(node, options);
+                },
+
                 .struct_specifier => {
-                    const ok = try self.dumpStructAccessors(w, node);
-                    if (ok) try w.writeAll("\n\n");
+                    try self.dumpStructAccessors(node);
                 },
 
                 else => {},
@@ -178,11 +198,11 @@ const GenAccessors = struct {
 
     fn dumpStructAccessors(
         self: Self,
-        w: std.io.AnyWriter,
         struct_spec: ts.Node,
-    ) !bool {
+    ) !void {
         const source = self.source;
         const options = self.options;
+        const w = self.w;
 
         std.debug.assert(try Kind.get(struct_spec) == .struct_specifier);
         std.debug.assert(struct_spec.childCount() >= 3);
@@ -197,7 +217,7 @@ const GenAccessors = struct {
             };
 
             const ok = filter.predicate(filter.context, item);
-            if (!ok) return false;
+            if (!ok) return;
         }
 
         var field_iter = struct_body.iterateChildren();
@@ -260,8 +280,6 @@ const GenAccessors = struct {
                 });
             }
         }
-
-        return true;
     }
 
     /// Returns true if field declaration is
@@ -357,10 +375,11 @@ const GenAccessors = struct {
 const GenPrototype = struct {
     source: []const u8,
     options: Options = .{},
+    w: std.io.AnyWriter,
 
     const Self = @This();
 
-    pub const Filter = struct {
+    const Filter = struct {
         context: *anyopaque = undefined,
         predicate: *const fn (context: *anyopaque, item: FuncItem) bool,
     };
@@ -376,10 +395,11 @@ const GenPrototype = struct {
 
     fn functionProto(
         self: Self,
-        w: std.io.AnyWriter,
     ) !void {
         const source = self.source;
         const options = self.options;
+        const w = self.w;
+
         const language = tree_sitter_c();
         defer language.destroy();
 
@@ -392,8 +412,6 @@ const GenPrototype = struct {
         defer tree.destroy();
 
         const root = tree.rootNode();
-        var iter_children = root.iterateChildren();
-        defer iter_children.destroy();
 
         if (options.debug_tree) try root.writeJSON(stderr.writer().any(), .{ .source = source });
 
@@ -401,6 +419,17 @@ const GenPrototype = struct {
             try w.writeAll(options.prepend_str);
             try w.writeAll("\n");
         }
+
+        try self.dump(root);
+    }
+
+    fn dump(self: Self, root: ts.Node) !void {
+        const source = self.source;
+        const options = self.options;
+        const w = self.w;
+
+        var iter_children = root.iterateChildren();
+        defer iter_children.destroy();
 
         var i: usize = 0;
         var start_comment: ?usize = null;
@@ -429,6 +458,8 @@ const GenPrototype = struct {
                         try w.writeAll("\n\n");
                     }
                 },
+
+                .preproc_ifdef => try self.dump(node),
 
                 .function_definition => {
                     if (options.comments) {
@@ -593,13 +624,13 @@ fn dumpInclude(
     }
 }
 
-pub fn prototype(
+pub fn generatePrototype(
     source: String,
     w: std.io.AnyWriter,
     options: GenPrototype.Options,
 ) !void {
-    const gen = GenPrototype{ .source = source, .options = options };
-    try gen.functionProto(w);
+    const gen = GenPrototype{ .source = source, .options = options, .w = w };
+    try gen.functionProto();
 }
 
 // Caller must free returned string
@@ -608,19 +639,19 @@ pub fn prototypeString(
     source: String,
     options: GenPrototype.Options,
 ) ![]const u8 {
-    const gen = GenPrototype{ .source = source, .options = options };
     var buf = std.ArrayList(u8).init(allocator);
-    try gen.functionProto(buf.writer().any());
+    const gen = GenPrototype{ .source = source, .options = options, .w = buf.writer().any() };
+    try gen.functionProto();
     return buf.toOwnedSlice();
 }
 
-pub fn accessors(
+pub fn generateAccessors(
     source: String,
     w: std.io.AnyWriter,
     options: GenAccessors.Options,
 ) !void {
-    const gen = GenAccessors{ .source = source, .options = options };
-    try gen.accessors(w, options);
+    const gen = GenAccessors{ .source = source, .options = options, .w = w };
+    try gen.accessors(options);
 }
 
 pub fn accessorsString(
@@ -628,9 +659,9 @@ pub fn accessorsString(
     source: String,
     options: GenAccessors.Options,
 ) ![]const u8 {
-    const gen = GenAccessors{ .source = source, .options = options };
     var buf = std.ArrayList(u8).init(allocator);
-    try gen.accessors(buf.writer().any(), options);
+    const gen = GenAccessors{ .source = source, .options = options, .w = buf.writer().any() };
+    try gen.accessors(options);
     return buf.toOwnedSlice();
 }
 
@@ -712,6 +743,33 @@ test "generate function prototype" {
     try std.testing.expectEqualStrings(expected_bare, output_bare);
 }
 
+test "generate nested function prototype" {
+    const source =
+        \\#ifdef X
+        \\#ifdef Y
+        \\void foo(void) { }
+        \\int bar(int x) { return x; }
+        \\#endif
+        \\#endif
+    ;
+    const expected =
+        \\void foo(void);
+        \\
+        \\int bar(int x);
+        \\
+        \\
+    ;
+
+    const allocator = std.testing.allocator;
+    const output = try prototypeString(allocator, source, .{
+        .comments = true,
+        .retain_includes = true,
+    });
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(expected, output);
+}
+
 test "generate function prototype with filter" {
     const source =
         \\ extern inline static void foo() { }
@@ -768,7 +826,7 @@ test "generate accessors" {
     );
 }
 
-test "generate accessor prototype" {
+test "generate accessor header" {
     const code: []const u8 =
         \\int x;
         \\struct Foo {
@@ -795,10 +853,50 @@ test "generate accessor prototype" {
     );
 }
 
+test "generate accessor nested" {
+    const code: []const u8 =
+        \\int x;
+        \\#ifdef X
+        \\#ifdef Y
+        \\struct Foo {
+        \\  int a;
+        \\  char *b;
+        \\} X;
+        \\typedef struct Bar {
+        \\  int a;
+        \\  char *b;
+        \\} Y;
+        \\#endif
+        \\#endif
+    ;
+    const expected =
+        \\int Foo_get_a(const struct Foo *self);
+        \\void Foo_set_a(struct Foo *self, int val);
+        \\
+        \\char *Foo_get_b(const struct Foo *self);
+        \\void Foo_set_b(struct Foo *self, char *val);
+        \\
+        \\int Bar_get_a(const struct Bar *self);
+        \\void Bar_set_a(struct Bar *self, int val);
+        \\
+        \\char *Bar_get_b(const struct Bar *self);
+        \\void Bar_set_b(struct Bar *self, char *val);
+    ;
+
+    const output = try accessorsString(std.testing.allocator, code, .{
+        .func_prototype = true,
+    });
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, expected, "\n "),
+        std.mem.trim(u8, output, "\n "),
+    );
+}
+
 test "generate accessors, filter bitfielded structs" {
     const source =
         \\#include <stdio.h>
-        \\typedef struct AAA {int x: 100;} BBB;
         \\struct AAA {
         \\   int x; char y;
         \\   struct X *x;
