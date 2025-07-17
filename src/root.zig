@@ -26,6 +26,8 @@ const Kind = enum(u16) {
     function_declarator = 230,
     compound_statement = 241,
     storage_class_specifier = 242,
+    type_qualifier = 243,
+    sized_type_specifier = 246,
     enum_specifier = 247,
     struct_specifier = 249,
     union_specifier = 250,
@@ -231,19 +233,20 @@ const GenAccessors = struct {
         while (field_iter.nextNamed()) |field_decl| {
             if (try Kind.get(field_decl) != .field_declaration) continue;
 
-            const ftype = field_decl.namedChild(0).?;
-            const second_child = field_decl.namedChild(1) orelse {
+            const ident_index = try indexOfFieldIdentifier(field_decl) orelse continue;
+            const declarator = field_decl.namedChild(ident_index) orelse {
                 // field has no identifier
                 continue;
             };
-
-            const identifier, const ptr_count = try unwrapPointerDeclarators(second_child);
+            const identifier, const ptr_count = try unwrapPointerDeclarators(declarator);
+            const type_str = field_decl.rawChildren(source, 0, ident_index - 1);
 
             if (try isFieldAnonContainer(field_decl)) {
                 // skip if it's a pointer to anonymous struct or union
                 if (ptr_count > 0) continue;
 
-                const c = ftype.child(1).?;
+                const ftype = field_decl.namedChild(ident_index - 1) orelse continue;
+                const c = ftype.child(1) orelse continue;
                 var iter = c.iterateChildren();
                 defer iter.destroy();
 
@@ -255,8 +258,9 @@ const GenAccessors = struct {
                     // (or rather I just want to keep it simple for now)
                     if (try isFieldAnonContainer(sub_field_decl)) continue;
 
-                    const sub_ftype = sub_field_decl.namedChild(0).?;
-                    const sub_child = sub_field_decl.namedChild(1) orelse {
+                    const sub_index = try indexOfFieldIdentifier(sub_field_decl) orelse continue;
+                    const sub_type_str = sub_field_decl.rawChildren(source, 0, sub_index - 1);
+                    const sub_child = sub_field_decl.namedChild(sub_index) orelse {
                         // field has no identifier
                         continue;
                     };
@@ -265,7 +269,7 @@ const GenAccessors = struct {
                     try writeAccessor(
                         .{
                             .w = w,
-                            .return_type = sub_ftype.raw(source),
+                            .return_type = sub_type_str,
                             .ptr_count = sub_ptr_count,
                             .struct_name = struct_name,
                             .prop_name = sub_identifier.raw(source),
@@ -277,7 +281,7 @@ const GenAccessors = struct {
             } else {
                 try writeAccessor(.{
                     .w = w,
-                    .return_type = ftype.raw(source),
+                    .return_type = type_str,
                     .ptr_count = ptr_count,
                     .struct_name = struct_name,
                     .prop_name = identifier.raw(source),
@@ -285,6 +289,20 @@ const GenAccessors = struct {
                 });
             }
         }
+    }
+
+    fn indexOfFieldIdentifier(field_decl: ts.Node) !?u32 {
+        // bitfield size and type specifiers are optional
+        // const int *x: 100;
+        //     ^--- get the index of this
+        var ident_index = field_decl.namedChildCount() - 1;
+        if (ident_index < 1) return null;
+
+        const kind = try Kind.get(field_decl.namedChild(ident_index));
+        if (ident_index > 0 and kind == .bitfield_clause)
+            ident_index -= 1;
+
+        return ident_index;
     }
 
     /// Returns true if field declaration is
@@ -509,10 +527,8 @@ const GenPrototype = struct {
             start_index += 1;
         }
 
-        const decl, var ptr_count = try unwrapPointerDeclarators(fn_def.child(start_index + 1).?);
+        const decl, _ = try unwrapPointerDeclarators(fn_def.child(start_index + 1).?);
         const kind: Kind = try .get(decl);
-        std.debug.assert(kind == .function_declarator or kind == .parenthesized_declarator);
-        std.debug.assert(decl.childCount() >= 2);
 
         // the node structure is different for functions like: int int funcname(void) { }
         // where the parameter is just void identifier.
@@ -532,58 +548,32 @@ const GenPrototype = struct {
         }
 
         if (is_void_arg) {
-            const paren_decl = decl;
-            const identifier = paren_decl.child(1).?.raw(source);
             try w.writeAll(fn_name);
-            try w.writeAll("(");
-            try w.writeAll(identifier);
-            try w.writeAll(");");
+            try w.writeAll(decl.raw(source));
+            try w.writeAll(";");
             return true;
         }
 
-        const fn_decl = decl;
-        const ret_type = fn_def.child(start_index).?.raw(source);
+        var iter = fn_def.iterateChildren();
+        defer iter.destroy();
 
-        try w.writeAll(ret_type);
-        if (ret_type.len > 0) try w.writeAll(" ");
+        const num_children = fn_def.childCount();
+        var i: usize = 0;
+        while (iter.next()) |n| {
+            if (i >= num_children - 1) break;
 
-        for (0..ptr_count) |_| {
-            try w.writeAll("*");
-        }
-        try w.writeAll(fn_name);
-
-        try w.writeAll("(");
-        {
-            const parameters = fn_decl.child(1).?;
-            std.debug.assert(try Kind.get(parameters) == .parameter_list);
-
-            var param_iter = parameters.iterateChildren();
-            defer param_iter.destroy();
-
-            var i: usize = 0;
-            const num_params = parameters.namedChildCount();
-            while (param_iter.nextNamed()) |param| {
-                std.debug.assert(param.childCount() >= 1);
-
-                const ptype = param.child(0).?.raw(source);
-                try w.writeAll(ptype);
-
-                if (param.child(1)) |pointer_decls| {
-                    try w.writeAll(" ");
-                    const identifier, ptr_count = try unwrapPointerDeclarators(pointer_decls);
-                    for (0..ptr_count) |_| {
-                        try w.writeAll("*");
-                    }
-                    try w.writeAll(identifier.raw(source));
-                }
-
-                if (i < num_params - 1) {
-                    try w.writeAll(", ");
-                }
-                i += 1;
+            switch (try Kind.get(n)) {
+                .storage_class_specifier => {
+                    // do not print extern or inline
+                },
+                else => {
+                    try w.writeAll(n.raw(source));
+                    if (i < num_children - 2) try w.writeAll(" ");
+                },
             }
+            i += 1;
         }
-        try w.writeAll(");");
+        try w.writeAll(";");
 
         return true;
     }
@@ -671,7 +661,7 @@ test "generate function prototype" {
         \\
         \\ int x = 10; // will not be included
         \\ int z = 10; // will not be included
-        \\struct Bar** foo(int x, char * y) { return 0; }
+        \\inline const struct Bar **foo(int x, char *y, const int* const z) { return 0; }
         \\
         \\int y = 123; // will not be included
         \\
@@ -694,7 +684,7 @@ test "generate function prototype" {
     const expected =
         \\#include "def.h"
         \\
-        \\struct Bar **foo(int x, char *y);
+        \\const struct Bar **foo(int x, char *y, const int* const z);
         \\
         \\//this is bar
         \\//bar does something
@@ -712,7 +702,7 @@ test "generate function prototype" {
     ;
 
     const expected_bare =
-        \\struct Bar **foo(int x, char *y);
+        \\const struct Bar **foo(int x, char *y, const int* const z);
         \\
         \\void bar();
         \\
@@ -855,11 +845,11 @@ test "generate accessor header" {
 
 test "generate accessor nested" {
     const code: []const u8 =
-        \\int x;
         \\#ifdef X
         \\#ifdef Y
+        \\int x;
         \\struct Foo {
-        \\  int a;
+        \\  const int a;
         \\  char *b;
         \\} X;
         \\typedef struct Bar {
@@ -870,8 +860,8 @@ test "generate accessor nested" {
         \\#endif
     ;
     const expected =
-        \\int Foo_get_a(const struct Foo *self);
-        \\void Foo_set_a(struct Foo *self, int val);
+        \\const int Foo_get_a(const struct Foo *self);
+        \\void Foo_set_a(struct Foo *self, const int val);
         \\
         \\char *Foo_get_b(const struct Foo *self);
         \\void Foo_set_b(struct Foo *self, char *val);
@@ -939,7 +929,7 @@ test "generate accessors with anonymous structs" {
         \\struct Foo {
         \\  int x;
         \\  struct {
-        \\    int a;
+        \\    const int a;
         \\    char *b;
         \\  } data;
         \\
@@ -958,8 +948,8 @@ test "generate accessors with anonymous structs" {
         \\extern inline int Foo_get_x(const struct Foo *self) { return self->x; }
         \\extern inline void Foo_set_x(struct Foo *self, int val) { self->x = val; }
         \\
-        \\extern inline int Foo_get_data_a(const struct Foo *self) { return self->data.a; }
-        \\extern inline void Foo_set_data_a(struct Foo *self, int val) { self->data.a = val; }
+        \\extern inline const int Foo_get_data_a(const struct Foo *self) { return self->data.a; }
+        \\extern inline void Foo_set_data_a(struct Foo *self, const int val) { self->data.a = val; }
         \\
         \\extern inline char *Foo_get_data_b(const struct Foo *self) { return self->data.b; }
         \\extern inline void Foo_set_data_b(struct Foo *self, char *val) { self->data.b = val; }
