@@ -6,7 +6,7 @@ const String = []const u8;
 
 // TODO: use new io
 
-pub extern fn tree_sitter_c() callconv(.C) *const ts.Language;
+pub extern fn tree_sitter_c() callconv(.c) *const ts.Language;
 
 const Kind = enum(u16) {
     unknown = 0,

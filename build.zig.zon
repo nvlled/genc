@@ -2,19 +2,19 @@
     .name = .genc,
     .version = "0.0.0",
     .fingerprint = 0xe66c6fa66d4cfdf0, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.15.0-dev.764+2e3154428",
+    .minimum_zig_version = "14.1.0",
     .dependencies = .{
         .intf = .{
             .url = "https://github.com/nvlled/zig-intf/archive/refs/heads/main.tar.gz",
             .hash = "intf-0.0.0-Fj_qm5VoAADERaFPR-K7XjKVysObVMI8xe6eb0n4NfDh",
         },
-        .tree_sitter = .{
-            .url = "git+https://github.com/nvlled/zig-tree-sitter#9e79e11a5c8992377c7a1fcf205d6bc79d1a8867",
-            .hash = "tree_sitter-0.25.0-8heIf8bIAQA31lWZNaLHdGZbBOhs7a1FnPWKGIhJte88",
-        },
         .tree_sitter_c = .{
-            .url = "git+https://github.com/nvlled/tree-sitter-c#fe11189348b6b8560d60f1e7891bfbfa1852a553",
-            .hash = "tree_sitter_c-0.24.0-VJuGjGhgQAD4MaEXLc8vMAVe6opNwbZpIN_HGY50KlZf",
+            .url = "git+https://github.com/nvlled/tree-sitter-c#5c5ece702375911e27756dced580d8f4b27028ff",
+            .hash = "tree_sitter_c-0.24.0-VJuGjEphQAB8KWvZz5-mPuGrEd7E8u8-liPlYx3cBsSO",
+        },
+        .tree_sitter = .{
+            .url = "git+https://github.com/nvlled/zig-tree-sitter#ad5575425cfc4a4850c00cc2c31e63488b072ff8",
+            .hash = "tree_sitter-0.25.0-8heIf2fUAQAh8EbjZp8GGVB4jN7wKfhYWXxKbCMVC1lI",
         },
     },
     .paths = .{
