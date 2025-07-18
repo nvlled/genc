@@ -535,8 +535,8 @@ const GenPrototype = struct {
         const is_void_arg = kind == .parenthesized_declarator;
 
         const fn_name = switch (is_void_arg) {
-            true => fn_def.child(start_index).?.raw(source),
-            false => decl.child(0).?.raw(source),
+            true => if (fn_def.child(start_index)) |n| n.raw(source) else "",
+            false => if (decl.child(0)) |n| n.raw(source) else "",
         };
 
         if (options.filter) |filter| {
