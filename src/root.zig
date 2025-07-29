@@ -17,6 +17,7 @@ const Kind = enum(u16) {
     preproc_include = 164,
     preproc_def = 165,
     preproc_call = 168,
+    preproc_if = 169,
     preproc_ifdef = 170,
     function_definition = 196,
     declaration = 198,
@@ -192,7 +193,7 @@ const GenAccessors = struct {
                     }
                 },
 
-                .preproc_ifdef => try self.dump(node, options),
+                .preproc_if, .preproc_ifdef => try self.dump(node, options),
 
                 .linkage_specification => {
                     if (node.childByFieldName("body")) |body| {
@@ -455,13 +456,11 @@ const GenPrototype = struct {
         var iter_children = root.iterateChildren();
         defer iter_children.destroy();
 
-        var i: usize = 0;
         var start_comment: ?usize = null;
         while (iter_children.nextNamed()) |node| {
             const kind: Kind = try .get(node);
 
             defer {
-                i += 1;
                 if (kind != .comment) {
                     start_comment = null;
                 }
@@ -482,7 +481,7 @@ const GenPrototype = struct {
                     }
                 },
 
-                .preproc_ifdef => try self.dump(node),
+                .preproc_if, .preproc_ifdef => try self.dump(node),
 
                 .linkage_specification => {
                     if (node.childByFieldName("body")) |body| {
@@ -629,14 +628,12 @@ const GenSourceAndProto = struct {
         var iter_children = root.iterateChildren();
         defer iter_children.destroy();
 
-        var i: usize = 0;
         var start_comment: ?usize = null;
-        var byte_offset: usize = 0;
+        var byte_offset: usize = @intCast(root.startByte());
         while (iter_children.nextNamed()) |node| {
             const kind: Kind = try .get(node);
 
             defer {
-                i += 1;
                 if (kind != .comment) {
                     start_comment = null;
                 }
@@ -650,11 +647,19 @@ const GenSourceAndProto = struct {
                     }
                 },
 
-                .preproc_ifdef => try self.dump(node),
+                .preproc_if, .preproc_ifdef => {
+                    try header.writeAll(source[byte_offset..node.startByte()]);
+                    try self.dump(node);
+                    try header.writeAll("\n\n");
+                    byte_offset = node.endByte();
+                },
 
                 .linkage_specification => {
                     if (node.childByFieldName("body")) |body| {
+                        try header.writeAll(source[byte_offset..node.startByte()]);
                         try self.dump(body);
+                        try header.writeAll("\n\n");
+                        byte_offset = node.endByte();
                     }
                 },
 
@@ -688,8 +693,8 @@ const GenSourceAndProto = struct {
             }
         }
 
-        if (byte_offset < source.len) {
-            var s = source[byte_offset..source.len];
+        if (byte_offset < root.endByte()) {
+            var s = source[byte_offset..root.endByte()];
             s = std.mem.trim(u8, s, "\n \t");
             try header.writeAll(s);
         }
@@ -887,7 +892,7 @@ test "generate function prototype" {
 
 test "generate nested function prototype" {
     const source =
-        \\#ifdef X
+        \\#if X
         \\#ifdef Y
         \\extern "C" {
         \\void foo(void) { }
@@ -999,7 +1004,7 @@ test "generate accessor header" {
 
 test "generate accessor nested" {
     const code: []const u8 =
-        \\#ifdef X
+        \\#if X
         \\#ifdef Y
         \\
         \\extern "C" {
@@ -1164,6 +1169,7 @@ test "skip pointers to anonymous structs" {
 test "generate source and proto" {
     const source: []const u8 =
         \\#include "x.h";
+        \\#ifdef Y
         \\
         \\struct X { };
         \\int xyz;
@@ -1180,10 +1186,15 @@ test "generate source and proto" {
         \\int bar(int x) { return 1;}
         \\//some comment 4
         \\ struct Y { };
+        \\
+        \\#endif
+        \\
+        \\int abc;
     ;
 
     const expected_header =
         \\#include "x.h";
+        \\#ifdef Y
         \\
         \\struct X { };
         \\int xyz;
@@ -1195,6 +1206,9 @@ test "generate source and proto" {
         \\//some comment 4
         \\ struct Y { };
         \\
+        \\#endif
+        \\
+        \\int abc;
     ;
 
     const expected_code =
