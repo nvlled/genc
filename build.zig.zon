@@ -13,7 +13,8 @@
             .hash = "tree_sitter-0.25.0-8heIf2fUAQAh8EbjZp8GGVB4jN7wKfhYWXxKbCMVC1lI",
         },
         .tree_sitter_c = .{
-            .path = "../tree-sitter-c",
+            .url = "git+https://github.com/nvlled/tree-sitter-c#01ff407c94faae17e46f272272ae3eac4e2567df",
+            .hash = "tree_sitter_c-0.24.0-VJuGjE9iQAAi9IJx_gbc7-YAcSqVI33oLEQQyz4G3JWF",
         },
     },
     .paths = .{
