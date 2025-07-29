@@ -1,12 +1,11 @@
 const std = @import("std");
 const stderr = std.io.getStdErr();
 const ts = @import("tree-sitter");
+const ts_c = @import("tree-sitter-c");
 const intf = @import("intf");
 const String = []const u8;
 
 // TODO: use new io
-
-pub extern fn tree_sitter_c() callconv(.c) *const ts.Language;
 
 const Kind = enum(u16) {
     unknown = 0,
@@ -145,7 +144,7 @@ const GenAccessors = struct {
         options: Options,
     ) !void {
         const source = self.source;
-        const language = tree_sitter_c();
+        const language: *const ts.Language = @ptrCast(ts_c.language());
         defer language.destroy();
 
         std.debug.assert(language.abiVersion() == ts.LANGUAGE_VERSION);
@@ -418,7 +417,7 @@ const GenPrototype = struct {
         const options = self.options;
         const w = self.w;
 
-        const language = tree_sitter_c();
+        const language: *const ts.Language = @ptrCast(ts_c.language());
         defer language.destroy();
 
         std.debug.assert(language.abiVersion() == ts.LANGUAGE_VERSION);
