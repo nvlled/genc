@@ -16,10 +16,13 @@ const Kind = enum(u16) {
     comment = 160,
     preproc_include = 164,
     preproc_def = 165,
+    preproc_call = 168,
     preproc_ifdef = 170,
     function_definition = 196,
     declaration = 198,
     type_definition = 199,
+    linkage_specification = 204,
+    declaration_list = 213,
     parenthesized_declarator = 219,
     pointer_declarator = 226,
     function_declarator = 230,
@@ -189,8 +192,12 @@ const GenAccessors = struct {
                     }
                 },
 
-                .preproc_ifdef => {
-                    try self.dump(node, options);
+                .preproc_ifdef => try self.dump(node, options),
+
+                .linkage_specification => {
+                    if (node.childByFieldName("body")) |body| {
+                        try self.dump(body, options);
+                    }
                 },
 
                 .struct_specifier => {
@@ -477,6 +484,12 @@ const GenPrototype = struct {
 
                 .preproc_ifdef => try self.dump(node),
 
+                .linkage_specification => {
+                    if (node.childByFieldName("body")) |body| {
+                        try self.dump(body);
+                    }
+                },
+
                 .function_definition => {
                     if (options.comments) {
                         const j = start_comment orelse node.startByte();
@@ -638,6 +651,12 @@ const GenSourceAndProto = struct {
                 },
 
                 .preproc_ifdef => try self.dump(node),
+
+                .linkage_specification => {
+                    if (node.childByFieldName("body")) |body| {
+                        try self.dump(body);
+                    }
+                },
 
                 .function_definition => {
                     const range = node.range();
@@ -870,8 +889,10 @@ test "generate nested function prototype" {
     const source =
         \\#ifdef X
         \\#ifdef Y
+        \\extern "C" {
         \\void foo(void) { }
         \\int bar(int x) { return x; }
+        \\}
         \\#endif
         \\#endif
     ;
@@ -980,6 +1001,9 @@ test "generate accessor nested" {
     const code: []const u8 =
         \\#ifdef X
         \\#ifdef Y
+        \\
+        \\extern "C" {
+        \\
         \\int x;
         \\struct Foo {
         \\  const int a;
@@ -989,6 +1013,9 @@ test "generate accessor nested" {
         \\  int a;
         \\  char *b;
         \\} Y;
+        \\
+        \\}
+        \\
         \\#endif
         \\#endif
     ;
