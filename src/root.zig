@@ -176,7 +176,7 @@ const GenAccessors = struct {
             switch (kind) {
                 .preproc_include => {
                     if (options.retain_includes) {
-                        try dumpInclude(source, w, node);
+                        try w.writeAll(node.raw(source));
                         try w.writeAll("\n\n");
                     }
                 },
@@ -462,17 +462,16 @@ const GenPrototype = struct {
 
             switch (kind) {
                 .comment => {
-                    const range = node.startByte();
-                    if (range > 0 and range < source.len - 1 and source[range - 1] == '\n') {
+                    if (start_comment == null and isLineComment(node, source)) {
                         // only include comments that start on a new line
-                        start_comment = start_comment orelse i;
+                        start_comment = @intCast(node.startByte());
                     }
                 },
 
                 .preproc_include => {
                     if (options.retain_includes) {
-                        try dumpInclude(source, w, node);
-                        try w.writeAll("\n\n");
+                        try w.writeAll(node.raw(source));
+                        try w.writeAll("\n");
                     }
                 },
 
@@ -480,11 +479,8 @@ const GenPrototype = struct {
 
                 .function_definition => {
                     if (options.comments) {
-                        for ((start_comment orelse i)..i) |k| {
-                            const comment = root.namedChild(@intCast(k)) orelse continue;
-                            try w.writeAll(comment.raw(source));
-                            try w.writeAll("\n");
-                        }
+                        const j = start_comment orelse node.startByte();
+                        try w.writeAll(source[j..node.startByte()]);
                     }
 
                     const ok = try self.dumpFnPrototype(w, node);
@@ -702,29 +698,6 @@ fn unwrapPointerDeclarators(node: ts.Node) !struct { ts.Node, usize } {
         count += 1;
     }
     return .{ current, count };
-}
-
-fn dumpInclude(
-    source: []const u8,
-    w: std.io.AnyWriter,
-    include_node: ts.Node,
-) !void {
-    const path = include_node.child(1) orelse return;
-
-    try w.writeAll("#include ");
-    switch (try Kind.get(path)) {
-        else => {},
-        .string_literal => {
-            if (path.child(1)) |str| {
-                try w.writeByte('"');
-                try w.writeAll(str.raw(source));
-                try w.writeByte('"');
-            }
-        },
-        .system_lib_string => {
-            try w.writeAll(path.raw(source));
-        },
-    }
 }
 
 // TODO: add doc comments
