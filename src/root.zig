@@ -16,9 +16,11 @@ const Kind = enum(u16) {
     comment = 160,
     preproc_include = 164,
     preproc_def = 165,
+    preproc_function_def = 166,
     preproc_call = 168,
     preproc_if = 169,
     preproc_ifdef = 170,
+    preproc_else = 171,
     function_definition = 196,
     declaration = 198,
     type_definition = 199,
@@ -40,6 +42,7 @@ const Kind = enum(u16) {
     parameter_list = 258,
     for_statement = 273,
     expression_statement = 266,
+    binary_expresssion = 290,
     string_literal = 320,
     macro_type_specifier = 323,
     field_identifier = 360,
@@ -193,7 +196,7 @@ const GenAccessors = struct {
                     }
                 },
 
-                .preproc_if, .preproc_ifdef => try self.dump(node, options),
+                .preproc_if, .preproc_else, .preproc_ifdef => try self.dump(node, options),
 
                 .linkage_specification => {
                     if (node.childByFieldName("body")) |body| {
@@ -481,7 +484,7 @@ const GenPrototype = struct {
                     }
                 },
 
-                .preproc_if, .preproc_ifdef => try self.dump(node),
+                .preproc_if, .preproc_else, .preproc_ifdef => try self.dump(node),
 
                 .linkage_specification => {
                     if (node.childByFieldName("body")) |body| {
@@ -595,12 +598,18 @@ const GenSourceAndProto = struct {
     const Self = @This();
 
     const Options = struct {
+        prepend_code_str: []const u8 = &.{},
+        prepend_header_str: []const u8 = &.{},
         debug_tree: bool = false,
+        append_code_str: []const u8 = &.{},
+        append_header_str: []const u8 = &.{},
     };
 
     pub fn segregate(self: Self) !void {
         const source = self.source;
         const options = self.options;
+        const code = self.code_dest;
+        const header = self.header_dest;
 
         const language: *const ts.Language = @ptrCast(ts_c.language());
         defer language.destroy();
@@ -617,7 +626,25 @@ const GenSourceAndProto = struct {
 
         if (options.debug_tree) try root.writeJSON(stderr.writer().any(), .{ .source = source });
 
+        if (options.prepend_code_str.len > 0) {
+            try code.writeAll(options.prepend_code_str);
+            try code.writeAll("\n");
+        }
+        if (options.prepend_header_str.len > 0) {
+            try header.writeAll(options.prepend_header_str);
+            try header.writeAll("\n");
+        }
+
         try self.dump(root);
+
+        if (options.append_code_str.len > 0) {
+            try code.writeAll(options.append_code_str);
+            try code.writeAll("\n");
+        }
+        if (options.append_header_str.len > 0) {
+            try header.writeAll(options.append_header_str);
+            try header.writeAll("\n");
+        }
     }
 
     fn dump(self: Self, root: ts.Node) !void {
@@ -647,7 +674,7 @@ const GenSourceAndProto = struct {
                     }
                 },
 
-                .preproc_if, .preproc_ifdef => {
+                .preproc_if, .preproc_else, .preproc_ifdef => {
                     try header.writeAll(source[byte_offset..node.startByte()]);
                     try self.dump(node);
                     try header.writeAll("\n\n");
