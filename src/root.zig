@@ -578,6 +578,120 @@ const GenPrototype = struct {
     }
 };
 
+const GenSourceAndProto = struct {
+    source: []const u8,
+    options: Options = .{},
+    code_dest: std.io.AnyWriter,
+    header_dest: std.io.AnyWriter,
+
+    const Self = @This();
+
+    const Options = struct {
+        debug_tree: bool = false,
+    };
+
+    pub fn segregate(self: Self) !void {
+        const source = self.source;
+        const options = self.options;
+
+        const language: *const ts.Language = @ptrCast(ts_c.language());
+        defer language.destroy();
+
+        std.debug.assert(language.abiVersion() == ts.LANGUAGE_VERSION);
+        const parser = ts.Parser.create();
+        defer parser.destroy();
+        try parser.setLanguage(language);
+
+        const tree = parser.parseString(source, null) orelse @panic("failed to parse");
+        defer tree.destroy();
+
+        const root = tree.rootNode();
+
+        if (options.debug_tree) try root.writeJSON(stderr.writer().any(), .{ .source = source });
+
+        try self.dump(root);
+    }
+
+    fn dump(self: Self, root: ts.Node) !void {
+        const source = self.source;
+        const code = self.code_dest;
+        const header = self.header_dest;
+
+        var iter_children = root.iterateChildren();
+        defer iter_children.destroy();
+
+        var i: usize = 0;
+        var start_comment: ?usize = null;
+        var byte_offset: usize = 0;
+        while (iter_children.nextNamed()) |node| {
+            const kind: Kind = try .get(node);
+
+            defer {
+                i += 1;
+                if (kind != .comment) {
+                    start_comment = null;
+                }
+            }
+
+            switch (kind) {
+                .comment => {
+                    if (isLineComment(node, source) and start_comment == null) {
+                        // only include comments that start on a new line
+                        start_comment = @intCast(node.startByte());
+                    }
+                },
+
+                .preproc_ifdef => try self.dump(node),
+
+                .function_definition => {
+                    const range = node.range();
+                    if (start_comment) |start| {
+                        try code.writeAll(source[start..node.startByte()]);
+
+                        var s = source[byte_offset..start];
+                        s = std.mem.trim(u8, s, "\n \t");
+                        if (s.len > 0) {
+                            try header.writeAll(s);
+                            try header.writeAll("\n\n");
+                        }
+                    } else {
+                        var s = source[byte_offset..range.start_byte];
+                        s = std.mem.trim(u8, s, "\n \t");
+                        if (s.len > 0) {
+                            try header.writeAll(s);
+                            try header.writeAll("\n\n");
+                        }
+                    }
+
+                    try code.writeAll(source[range.start_byte..range.end_byte]);
+                    try code.writeAll("\n\n");
+
+                    byte_offset = range.end_byte;
+                },
+
+                else => {},
+            }
+        }
+
+        if (byte_offset < source.len) {
+            var s = source[byte_offset..source.len];
+            s = std.mem.trim(u8, s, "\n \t");
+            try header.writeAll(s);
+        }
+    }
+};
+
+fn isLineComment(comment_node: ts.Node, source: []const u8) bool {
+    // line comment is one that occupies the whole line on it's own:
+    //```c
+    //   // a line comment
+    //   int x; // not a line comment
+    //```
+    const i = comment_node.startByte();
+    if (i == 0) return true;
+    return source[i - 1] == '\n';
+}
+
 // tree-sitter-c wraps the identifier with one or more pointer declarations,
 // so this function returns the identifier and number of * before it
 fn unwrapPointerDeclarators(node: ts.Node) !struct { ts.Node, usize } {
@@ -611,6 +725,50 @@ fn dumpInclude(
             try w.writeAll(path.raw(source));
         },
     }
+}
+
+// TODO: add doc comments
+// TODO: update main exe
+
+pub fn segregateSourceAndProto(
+    source: String,
+    code_dest: std.io.AnyWriter,
+    header_dest: std.io.AnyWriter,
+    options: GenSourceAndProto.Options,
+) !void {
+    const gen = GenSourceAndProto{
+        .source = source,
+        .code_dest = code_dest,
+        .header_dest = header_dest,
+        .options = options,
+    };
+    try gen.segregate();
+}
+
+// Caller must free two returned string
+pub fn sourceAndProto(
+    allocator: std.mem.Allocator,
+    source: String,
+    options: GenSourceAndProto.Options,
+) !struct {
+    code: []const u8,
+    header: []const u8,
+} {
+    var code_buf = std.ArrayList(u8).init(allocator);
+    var header_buf = std.ArrayList(u8).init(allocator);
+    const gen = GenSourceAndProto{
+        .source = source,
+        .options = options,
+        .code_dest = code_buf.writer().any(),
+        .header_dest = header_buf.writer().any(),
+    };
+
+    try gen.segregate();
+
+    return .{
+        .code = try code_buf.toOwnedSlice(),
+        .header = try header_buf.toOwnedSlice(),
+    };
 }
 
 pub fn generatePrototype(
@@ -656,7 +814,8 @@ pub fn accessorsString(
 
 test "generate function prototype" {
     const source =
-        \\ #include "def.h"
+        \\#include "def.h"
+        \\#include <stdio.h>
         \\
         \\ int x = 10; // will not be included
         \\ int z = 10; // will not be included
@@ -682,6 +841,8 @@ test "generate function prototype" {
     ;
     const expected =
         \\#include "def.h"
+        \\
+        \\#include <stdio.h>
         \\
         \\const struct Bar **foo(int x, char *y, const int* const z);
         \\
@@ -997,5 +1158,68 @@ test "skip pointers to anonymous structs" {
     try std.testing.expectEqualStrings(
         std.mem.trim(u8, expected, "\n "),
         std.mem.trim(u8, output, "\n "),
+    );
+}
+
+test "generate source and proto" {
+    const source: []const u8 =
+        \\#include "x.h";
+        \\
+        \\struct X { };
+        \\int xyz;
+        \\
+        \\//some comment 1
+        \\void foo(int x) { }
+        \\//some comment 2
+        \\
+        \\void bar(int x);
+        \\//some comment 3.1
+        \\//some comment 3.2
+        \\//some comment 3.3
+        \\//some comment 3.4
+        \\int bar(int x) { return 1;}
+        \\//some comment 4
+        \\ struct Y { };
+    ;
+
+    const expected_header =
+        \\#include "x.h";
+        \\
+        \\struct X { };
+        \\int xyz;
+        \\
+        \\//some comment 2
+        \\
+        \\void bar(int x);
+        \\
+        \\//some comment 4
+        \\ struct Y { };
+        \\
+    ;
+
+    const expected_code =
+        \\//some comment 1
+        \\void foo(int x) { }
+        \\
+        \\//some comment 3.1
+        \\//some comment 3.2
+        \\//some comment 3.3
+        \\//some comment 3.4
+        \\int bar(int x) { return 1;}
+        \\
+    ;
+
+    const result = try sourceAndProto(std.testing.allocator, source, .{});
+    defer std.testing.allocator.free(result.code);
+    defer std.testing.allocator.free(result.header);
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, expected_code, "\n "),
+        std.mem.trim(u8, result.code, "\n "),
+    );
+
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, expected_header, "\n "),
+        std.mem.trim(u8, result.header, "\n "),
     );
 }
