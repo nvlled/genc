@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const stderr = std.io.getStdErr();
 const ts = @import("tree-sitter");
 const ts_c = @import("tree-sitter-c");
@@ -10,6 +11,7 @@ const String = []const u8;
 const Kind = enum(u16) {
     unknown = 0,
     identifier = 1,
+    long = 68,
     primitive_type = 93,
     pointer = 96,
     system_lib_string = 155,
@@ -29,6 +31,7 @@ const Kind = enum(u16) {
     parenthesized_declarator = 219,
     pointer_declarator = 226,
     function_declarator = 230,
+    array_declarator = 236,
     compound_statement = 241,
     storage_class_specifier = 242,
     type_qualifier = 243,
@@ -51,11 +54,16 @@ const Kind = enum(u16) {
     // TODO: log a message when this kind is encountered
     ERROR = 65535,
 
-    fn get(maybeNode: ?ts.Node) !Kind {
+    fn get(maybeNode: ?ts.Node) Kind {
         const node = maybeNode orelse return Kind.unknown;
-        return std.meta.intToEnum(Kind, node.kindId()) catch |err| {
-            std.debug.print("unregistered node kind: {s} = {d}\n", .{ node.kind(), node.kindId() });
-            return err;
+        return std.enums.fromInt(Kind, node.kindId()) orelse {
+            if (builtin.mode != .Debug) {
+                std.debug.panic("unregistered node kind: {s} = {d}\n", .{ node.kind(), node.kindId() });
+            } else {
+                std.debug.print("unregistered node kind: {s} = {d}\n", .{ node.kind(), node.kindId() });
+            }
+
+            return Kind.unknown;
         };
     }
 };
@@ -97,11 +105,12 @@ pub const StructItem = struct {
         defer field_iter.destroy();
 
         while (field_iter.nextNamed()) |field_decl| {
-            // ignore intToEnum parse errors
-            if ((Kind.get(field_decl) catch Kind.unknown) != .field_declaration) continue;
+            if ((Kind.get(field_decl)) != .field_declaration) continue;
 
             if (field_decl.namedChild(2)) |n| {
-                return (Kind.get(n) catch Kind.unknown) == .bitfield_clause;
+                if ((Kind.get(n)) == .bitfield_clause) {
+                    return true;
+                }
             }
         }
 
@@ -179,7 +188,7 @@ const GenAccessors = struct {
         defer iter_children.destroy();
 
         while (iter_children.nextNamed()) |node| {
-            const kind: Kind = try .get(node);
+            const kind: Kind = .get(node);
             switch (kind) {
                 .preproc_include => {
                     if (options.retain_includes) {
@@ -190,7 +199,7 @@ const GenAccessors = struct {
 
                 .type_definition, .declaration => {
                     if (node.namedChild(0)) |child| {
-                        if (try Kind.get(child) == .struct_specifier) {
+                        if (Kind.get(child) == .struct_specifier) {
                             try self.dumpStructAccessors(child);
                         }
                     }
@@ -221,11 +230,16 @@ const GenAccessors = struct {
         const options = self.options;
         const w = self.w;
 
-        std.debug.assert(try Kind.get(struct_spec) == .struct_specifier);
-        std.debug.assert(struct_spec.childCount() >= 3);
+        std.debug.assert(Kind.get(struct_spec) == .struct_specifier);
+
+        if (struct_spec.childCount() < 3) {
+            // not a struct definition, but a type declaration
+            return;
+        }
+
         const struct_name = struct_spec.child(1).?.raw(source);
         const struct_body = struct_spec.child(2).?;
-        std.debug.assert(try Kind.get(struct_body) == .field_declaration_list);
+        std.debug.assert(Kind.get(struct_body) == .field_declaration_list);
 
         if (options.filter) |filter| {
             const item = StructItem{
@@ -241,7 +255,7 @@ const GenAccessors = struct {
         defer field_iter.destroy();
 
         while (field_iter.nextNamed()) |field_decl| {
-            if (try Kind.get(field_decl) != .field_declaration) continue;
+            if (Kind.get(field_decl) != .field_declaration) continue;
 
             const ident_index = try indexOfFieldIdentifier(field_decl) orelse continue;
             const declarator = field_decl.namedChild(ident_index) orelse {
@@ -261,7 +275,7 @@ const GenAccessors = struct {
                 defer iter.destroy();
 
                 while (iter.nextNamed()) |sub_field_decl| {
-                    if (try Kind.get(sub_field_decl) != .field_declaration) continue;
+                    if (Kind.get(sub_field_decl) != .field_declaration) continue;
 
                     // Do not recursively descend into madness of nested anonymous structs
                     // Even if C and the Law allows it, I won't
@@ -308,7 +322,7 @@ const GenAccessors = struct {
         var ident_index = field_decl.namedChildCount() - 1;
         if (ident_index < 1) return null;
 
-        const kind = try Kind.get(field_decl.namedChild(ident_index));
+        const kind = Kind.get(field_decl.namedChild(ident_index));
         if (ident_index > 0 and kind == .bitfield_clause)
             ident_index -= 1;
 
@@ -329,7 +343,7 @@ const GenAccessors = struct {
         const ftype = field_decl.namedChild(0) orelse return false;
 
         if (ftype.child(1)) |c| {
-            return try Kind.get(c) == .field_declaration_list;
+            return c.isNamed() and Kind.get(c) == .field_declaration_list;
         }
         return false;
     }
@@ -461,7 +475,7 @@ const GenPrototype = struct {
 
         var start_comment: ?usize = null;
         while (iter_children.nextNamed()) |node| {
-            const kind: Kind = try .get(node);
+            const kind: Kind = .get(node);
 
             defer {
                 if (kind != .comment) {
@@ -520,13 +534,13 @@ const GenPrototype = struct {
         const source = self.source;
         const options = self.options;
 
-        std.debug.assert(try Kind.get(fn_def) == .function_definition);
+        std.debug.assert(Kind.get(fn_def) == .function_definition);
         std.debug.assert(fn_def.childCount() >= 2);
 
         var start_index: u32 = 0;
         var flags = FuncFlags{};
         while (fn_def.child(start_index)) |n| {
-            if (try Kind.get(n) != .storage_class_specifier) break;
+            if (Kind.get(n) != .storage_class_specifier) break;
             const tag = std.meta.stringToEnum(StorateClassSpec, n.raw(source));
             switch (tag orelse StorateClassSpec.unknown) {
                 .@"extern" => flags.is_extern = true,
@@ -538,7 +552,7 @@ const GenPrototype = struct {
         }
 
         const decl, _ = try unwrapPointerDeclarators(fn_def.child(start_index + 1).?);
-        const kind: Kind = try .get(decl);
+        const kind: Kind = .get(decl);
 
         // the node structure is different for functions like: int int funcname(void) { }
         // where the parameter is just void identifier.
@@ -572,7 +586,7 @@ const GenPrototype = struct {
         while (iter.next()) |n| {
             if (i >= num_children - 1) break;
 
-            switch (try Kind.get(n)) {
+            switch (Kind.get(n)) {
                 .storage_class_specifier => {
                     // do not print extern or inline
                 },
@@ -658,7 +672,7 @@ const GenSourceAndProto = struct {
         var start_comment: ?usize = null;
         var byte_offset: usize = @intCast(root.startByte());
         while (iter_children.nextNamed()) |node| {
-            const kind: Kind = try .get(node);
+            const kind: Kind = .get(node);
 
             defer {
                 if (kind != .comment) {
@@ -744,7 +758,7 @@ fn isLineComment(comment_node: ts.Node, source: []const u8) bool {
 fn unwrapPointerDeclarators(node: ts.Node) !struct { ts.Node, usize } {
     var count: usize = 0;
     var current = node;
-    while (try Kind.get(current) == .pointer_declarator) {
+    while (Kind.get(current) == .pointer_declarator) {
         current = current.child(1) orelse @panic("pointer_declarater must have two subnodes");
         count += 1;
     }
