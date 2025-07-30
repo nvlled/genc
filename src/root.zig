@@ -153,6 +153,28 @@ const GenAccessors = struct {
         append_str: []const u8 = &.{},
         filter: ?StructFilter = null,
         debug_tree: bool = false,
+        name_template: []const u8 = "${struct}_${access}_${parent}${field}",
+
+        const TemplateNames = enum {
+            // struct name
+            @"struct",
+
+            // "get" or "set"
+            access,
+
+            // the field name of the anonymous struct/union/enum
+            // for example:
+            //```
+            // struct X {
+            //  int x;
+            //  union {A,B,C} y;   <-- y is the parent name
+            //}
+            //```
+            parent,
+
+            // the field name of the struct
+            field,
+        };
     };
 
     fn accessors(
@@ -290,25 +312,25 @@ const GenAccessors = struct {
                     };
                     const sub_identifier, const sub_ptr_count = try unwrapPointerDeclarators(sub_child);
 
-                    try writeAccessor(
+                    try self.writeAccessor(
                         .{
                             .w = w,
                             .return_type = sub_type_str,
                             .ptr_count = sub_ptr_count,
                             .struct_name = struct_name,
-                            .prop_name = sub_identifier.raw(source),
-                            .namespace = identifier.raw(source),
+                            .field_name = sub_identifier.raw(source),
+                            .parent_name = identifier.raw(source),
                             .prototype = options.func_prototype,
                         },
                     );
                 }
             } else {
-                try writeAccessor(.{
+                try self.writeAccessor(.{
                     .w = w,
                     .return_type = type_str,
                     .ptr_count = ptr_count,
                     .struct_name = struct_name,
-                    .prop_name = identifier.raw(source),
+                    .field_name = identifier.raw(source),
                     .prototype = options.func_prototype,
                 });
             }
@@ -348,13 +370,51 @@ const GenAccessors = struct {
         return false;
     }
 
-    fn writeAccessor(args: struct {
+    fn write_function_name(w: std.io.AnyWriter, name_template: []const u8, args: struct {
+        struct_name: []const u8,
+        access_name: []const u8,
+        field_name: []const u8,
+        parent_name: ?[]const u8,
+    }) !void {
+        var i: usize = 0;
+
+        while (i < name_template.len) {
+            const start = std.mem.indexOfPos(u8, name_template, i, "${") orelse break;
+            const end = std.mem.indexOfPos(u8, name_template, start, "}") orelse break;
+            if (start >= end) break;
+
+            const name = name_template[start + 2 .. end];
+            const value = std.meta.stringToEnum(Options.TemplateNames, name) orelse {
+                std.debug.print("invalid name template key: '{s}'", .{name});
+                return error.InvalidTemplateKey;
+            };
+
+            const str = name_template[i..start];
+            try w.writeAll(str);
+
+            switch (value) {
+                .@"struct" => try w.writeAll(args.struct_name),
+                .access => try w.writeAll(args.access_name),
+                .field => try w.writeAll(args.field_name),
+                .parent => {
+                    if (args.parent_name) |pname| {
+                        try w.writeAll(pname);
+                        try w.writeAll("_");
+                    }
+                },
+            }
+
+            i = end + 1;
+        }
+    }
+
+    fn writeAccessor(self: Self, args: struct {
         w: std.io.AnyWriter,
         return_type: []const u8,
         ptr_count: usize,
         struct_name: []const u8,
-        prop_name: []const u8,
-        namespace: ?[]const u8 = null,
+        field_name: []const u8,
+        parent_name: ?[]const u8 = null,
         prototype: bool,
     }) !void {
         const w = args.w;
@@ -364,13 +424,14 @@ const GenAccessors = struct {
         for (0..args.ptr_count) |_| {
             try w.writeAll("*");
         }
-        try w.writeAll(args.struct_name);
-        try w.writeAll("_get_");
-        if (args.namespace) |name| {
-            try w.writeAll(name);
-            try w.writeAll("_");
-        }
-        try w.writeAll(args.prop_name);
+
+        try write_function_name(w, self.options.name_template, .{
+            .struct_name = args.struct_name,
+            .access_name = "get",
+            .parent_name = args.parent_name,
+            .field_name = args.field_name,
+        });
+
         try w.writeAll("(const struct ");
         try w.writeAll(args.struct_name);
         try w.writeAll(" *self)");
@@ -378,23 +439,24 @@ const GenAccessors = struct {
             try w.writeAll(";\n");
         } else {
             try w.writeAll(" { return self->");
-            if (args.namespace) |name| {
+            if (args.parent_name) |name| {
                 try w.writeAll(name);
                 try w.writeAll(".");
             }
-            try w.writeAll(args.prop_name);
+            try w.writeAll(args.field_name);
             try w.writeAll("; }\n");
         }
 
         if (!args.prototype) try w.writeAll("extern inline ");
         try w.writeAll("void ");
-        try w.writeAll(args.struct_name);
-        try w.writeAll("_set_");
-        if (args.namespace) |name| {
-            try w.writeAll(name);
-            try w.writeAll("_");
-        }
-        try w.writeAll(args.prop_name);
+
+        try write_function_name(w, self.options.name_template, .{
+            .struct_name = args.struct_name,
+            .access_name = "set",
+            .parent_name = args.parent_name,
+            .field_name = args.field_name,
+        });
+
         try w.writeAll("(struct ");
         try w.writeAll(args.struct_name);
         try w.writeAll(" *self, ");
@@ -408,11 +470,11 @@ const GenAccessors = struct {
             try w.writeAll(";");
         } else {
             try w.writeAll(" { self->");
-            if (args.namespace) |name| {
+            if (args.parent_name) |name| {
                 try w.writeAll(name);
                 try w.writeAll(".");
             }
-            try w.writeAll(args.prop_name);
+            try w.writeAll(args.field_name);
             try w.writeAll(" = val; }");
         }
         try w.writeAll("\n\n");
