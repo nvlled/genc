@@ -182,6 +182,7 @@ const GenAccessors = struct {
         options: Options,
     ) !void {
         const source = self.source;
+        const w = self.w;
         const language: *const ts.Language = @ptrCast(ts_c.language());
         defer language.destroy();
 
@@ -199,7 +200,17 @@ const GenAccessors = struct {
             try root.writeJSON(stderr.writer().any(), .{ .source = source });
         }
 
+        if (options.prepend_str.len > 0) {
+            try w.writeAll(options.prepend_str);
+            try w.writeAll("\n");
+        }
+
         try self.dump(root, options);
+
+        if (options.append_str.len > 0) {
+            try w.writeAll("\n");
+            try w.writeAll(options.append_str);
+        }
     }
 
     fn dump(self: Self, root: ts.Node, options: Options) !void {
@@ -525,6 +536,11 @@ const GenPrototype = struct {
         }
 
         try self.dump(root);
+
+        if (options.append_str.len > 0) {
+            try w.writeAll("\n");
+            try w.writeAll(options.append_str);
+        }
     }
 
     fn dump(self: Self, root: ts.Node) !void {
@@ -580,11 +596,6 @@ const GenPrototype = struct {
 
                 else => {},
             }
-        }
-
-        if (options.append_str.len > 0) {
-            try w.writeAll("\n");
-            try w.writeAll(options.append_str);
         }
     }
 
