@@ -856,6 +856,12 @@ pub fn sourceAndProto(
 } {
     var code_buf = std.ArrayList(u8).init(allocator);
     var header_buf = std.ArrayList(u8).init(allocator);
+
+    errdefer {
+        code_buf.deinit();
+        header_buf.deinit();
+    }
+
     const gen = GenSourceAndProto{
         .source = source,
         .options = options,
@@ -887,6 +893,8 @@ pub fn prototypeString(
     options: GenPrototype.Options,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+
     const gen = GenPrototype{ .source = source, .options = options, .w = buf.writer().any() };
     try gen.functionProto();
     return buf.toOwnedSlice();
@@ -907,6 +915,8 @@ pub fn accessorsString(
     options: GenAccessors.Options,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+
     const gen = GenAccessors{ .source = source, .options = options, .w = buf.writer().any() };
     try gen.accessors(options);
     return buf.toOwnedSlice();
